@@ -22,7 +22,7 @@ uint8_t g_write_uuid[16] = {0};
 uint8_t g_response_uuid[16] = {0};
 uint8_t g_send_data[MAX_DATA_LEN] = {0};
 size_t g_send_data_len = 0;
-bool g_verbose_debug= false;
+static bool g_verbose_debug= false;
 
 // UUID type variables for registration
 static uint8_t g_service_uuid_type = 0;
@@ -220,58 +220,45 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
         }
         case BLE_GAP_EVT_CONNECTED: {
     m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
-    printf("Connected! Handle: 0x%04x\n", m_conn_handle);
+    printf("\n=== CONNECTED TO DEVICE ===\n");
+    printf("Connection Handle: 0x%04x\n", m_conn_handle);
 
     // Register custom 128-bit UUIDs with Nordic SoftDevice
     uint32_t err;
     
-    // Create base UUID for service (with 16-bit placeholder at bytes 12-13)
+    printf("\n--- UUID REGISTRATION ---\n");
+    
+    // Service UUID
     ble_uuid128_t service_base_uuid;
     memcpy(service_base_uuid.uuid128, g_service_uuid, 16);
-    // Zero out bytes 12-13 for the 16-bit placeholder
     service_base_uuid.uuid128[12] = 0x00;
     service_base_uuid.uuid128[13] = 0x00;
     
     err = sd_ble_uuid_vs_add(m_adapter, &service_base_uuid, &g_service_uuid_type);
-    if (err == NRF_SUCCESS) {
-        printf("Registered service UUID base with type: %u\n", g_service_uuid_type);
-        register_uuid_in_registry(g_service_uuid_type, "SERVICE_UUID", g_service_uuid);
-    } else {
-        printf("Failed to register service UUID, error: %u\n", err);
-    }
+    printf("Service UUID -> Type: %u (16-bit: 0x%02X%02X)\n", 
+           g_service_uuid_type, g_service_uuid[13], g_service_uuid[12]);
     
-    // Create base UUID for write characteristic  
+    // Write UUID
     ble_uuid128_t write_base_uuid;
     memcpy(write_base_uuid.uuid128, g_write_uuid, 16);
-    // Zero out bytes 12-13 for the 16-bit placeholder
     write_base_uuid.uuid128[12] = 0x00;
     write_base_uuid.uuid128[13] = 0x00;
     
     err = sd_ble_uuid_vs_add(m_adapter, &write_base_uuid, &g_write_uuid_type);
-    if (err == NRF_SUCCESS) {
-        printf("Registered write UUID base with type: %u\n", g_write_uuid_type);
-        register_uuid_in_registry(g_write_uuid_type, "WRITE_UUID", g_write_uuid);
-    } else {
-        printf("Failed to register write UUID, error: %u\n", err);
-    }
+    printf("Write UUID -> Type: %u (16-bit: 0x%02X%02X)\n", 
+           g_write_uuid_type, g_write_uuid[13], g_write_uuid[12]);
     
-    // Create base UUID for response characteristic
+    // Response UUID
     ble_uuid128_t response_base_uuid;
     memcpy(response_base_uuid.uuid128, g_response_uuid, 16);
-    // Zero out bytes 12-13 for the 16-bit placeholder  
     response_base_uuid.uuid128[12] = 0x00;
     response_base_uuid.uuid128[13] = 0x00;
     
     err = sd_ble_uuid_vs_add(m_adapter, &response_base_uuid, &g_response_uuid_type);
-    if (err == NRF_SUCCESS) {
-        printf("Registered response UUID base with type: %u\n", g_response_uuid_type);
-        register_uuid_in_registry(g_response_uuid_type, "RESPONSE_UUID", g_response_uuid);
-    } else {
-        printf("Failed to register response UUID, error: %u\n", err);
-    }
+    printf("Response UUID -> Type: %u (16-bit: 0x%02X%02X)\n", 
+           g_response_uuid_type, g_response_uuid[13], g_response_uuid[12]);
 
-    // Start with general service discovery
-    printf("Starting general service discovery...\n");
+    printf("\n--- STARTING SERVICE DISCOVERY ---\n");
     sd_ble_gattc_primary_services_discover(m_adapter, m_conn_handle, 0x0001, NULL);
     break;
 }
@@ -280,107 +267,124 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             const ble_gattc_evt_prim_srvc_disc_rsp_t* p_srvc_disc_rsp = 
                 &(p_ble_evt->evt.gattc_evt.params.prim_srvc_disc_rsp);
             
-            if (g_verbose_debug) {
-                printf("Discovered %d services\n", p_srvc_disc_rsp->count);
-                // Dump all discovered services
-                for (int i = 0; i < p_srvc_disc_rsp->count; i++) {
-                    printf("Service %d: UUID type %u, UUID 0x%04X, Handle range: 0x%04X-0x%04X\n",
-                        i,
-                        p_srvc_disc_rsp->services[i].uuid.type,
-                        p_srvc_disc_rsp->services[i].uuid.uuid,
-                        p_srvc_disc_rsp->services[i].handle_range.start_handle,
-                        p_srvc_disc_rsp->services[i].handle_range.end_handle);
-                }
-            }
-            
-            // Continue discovery if there might be more services
-            if (p_srvc_disc_rsp->count > 0) {
-                uint16_t last_handle = p_srvc_disc_rsp->services[p_srvc_disc_rsp->count-1].handle_range.end_handle;
-                if (last_handle < 0xFFFF) {
-                    if (g_verbose_debug) printf("Continuing service discovery from handle 0x%04X\n", last_handle + 1);
-                    sd_ble_gattc_primary_services_discover(adapter, m_conn_handle, last_handle + 1, NULL);
-                    break;
-                }
-            }
-            
-            // Store your target service using proper UUID matching
+            // Only show discovered services summary
             for (int i = 0; i < p_srvc_disc_rsp->count; i++) {
-                // Get the 16-bit UUID from the original full UUID (bytes 12-13 in little-endian)
-                uint16_t target_service_uuid16 = (g_service_uuid[13] << 8) | g_service_uuid[12];
+                printf("Service %d: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X", 
+                    i,
+                    p_srvc_disc_rsp->services[i].uuid.type,
+                    p_srvc_disc_rsp->services[i].uuid.uuid,
+                    p_srvc_disc_rsp->services[i].handle_range.start_handle,
+                    p_srvc_disc_rsp->services[i].handle_range.end_handle);
                 
-                if (p_srvc_disc_rsp->services[i].uuid.type == g_service_uuid_type && 
-                    p_srvc_disc_rsp->services[i].uuid.uuid == target_service_uuid16 &&
+                // Mark if it's our target service
+                if (p_srvc_disc_rsp->services[i].uuid.type == g_service_uuid_type) {
+                    printf(" ← TARGET SERVICE");
+                }
+                printf("\n");
+            }
+            
+            // Store services from EVERY response (not just the last one)
+            for (int i = 0; i < p_srvc_disc_rsp->count; i++) {
+                // Skip only the standard Bluetooth services (0x1800, 0x1801)
+                if (p_srvc_disc_rsp->services[i].uuid.uuid != 0x1800 && 
+                    p_srvc_disc_rsp->services[i].uuid.uuid != 0x1801 && 
                     total_services < 10) {
                     
                     discovered_services[total_services] = p_srvc_disc_rsp->services[i];
-                    printf("✓ Found target service: UUID type %u, UUID 0x%04X, Handle range 0x%04X-0x%04X\n", 
+                    
+                    // Mark if this is our target service
+                    bool is_target = (p_srvc_disc_rsp->services[i].uuid.type == g_service_uuid_type);
+                    
+                    printf("Custom Service %d: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X%s\n", 
+                        total_services,
                         discovered_services[total_services].uuid.type,
                         discovered_services[total_services].uuid.uuid,
                         discovered_services[total_services].handle_range.start_handle,
-                        discovered_services[total_services].handle_range.end_handle);
+                        discovered_services[total_services].handle_range.end_handle,
+                        is_target ? " ← TARGET" : "");
+                    
                     total_services++;
+                }
+            }
+            
+            // Continue discovery if needed
+            if (p_srvc_disc_rsp->count > 0) {
+                uint16_t last_handle = p_srvc_disc_rsp->services[p_srvc_disc_rsp->count-1].handle_range.end_handle;
+                if (last_handle < 0xFFFF) {
+                    sd_ble_gattc_primary_services_discover(adapter, m_conn_handle, last_handle + 1, NULL);
+                    return; // Continue discovery, don't start characteristics yet
+                }
+            }
+            
+            // Discovery complete - now find and examine the target service
+            printf("\n--- FOUND %d CUSTOM SERVICES ---\n", total_services);
+            
+            // Start characteristic discovery for the TARGET service first
+            int target_service_index = -1;
+            for (int i = 0; i < total_services; i++) {
+                if (discovered_services[i].uuid.type == g_service_uuid_type) {
+                    target_service_index = i;
                     break;
                 }
             }
 
-            // Start characteristic discovery ONLY if we've finished discovering all services
-            if (p_srvc_disc_rsp->count == 0 || 
-                p_srvc_disc_rsp->services[p_srvc_disc_rsp->count-1].handle_range.end_handle == 0xFFFF) {
+            if (target_service_index >= 0) {
+                current_service_index = target_service_index;
+                printf("\n--- DISCOVERING CHARACTERISTICS IN TARGET SERVICE (Index %d) ---\n", target_service_index);
+                printf("Target Service: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X\n",
+                       discovered_services[target_service_index].uuid.type,
+                       discovered_services[target_service_index].uuid.uuid,
+                       discovered_services[target_service_index].handle_range.start_handle,
+                       discovered_services[target_service_index].handle_range.end_handle);
                 
-                if (total_services > 0) {
-                    printf("Discovering characteristics in target service...\n");
-                    current_service_index = 0;
-                    ble_gattc_handle_range_t handle_range = {
-                        .start_handle = discovered_services[0].handle_range.start_handle,
-                        .end_handle = discovered_services[0].handle_range.end_handle
-                    };
-                    sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
-                } else {
-                    printf("❌ Target service not found!\n");
-                }
+                ble_gattc_handle_range_t handle_range = {
+                    .start_handle = discovered_services[target_service_index].handle_range.start_handle,
+                    .end_handle = discovered_services[target_service_index].handle_range.end_handle
+                };
+                sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
+            } else {
+                printf("❌ Target service not found in stored services!\n");
             }
             break;
-        }
+}
         
         // After characteristic discovery, save handle and send data:
         case BLE_GATTC_EVT_CHAR_DISC_RSP: {
             const ble_gattc_evt_char_disc_rsp_t* p_char_disc_rsp = &(p_ble_evt->evt.gattc_evt.params.char_disc_rsp);
             
-            if (g_verbose_debug) {
-                printf("Found %d characteristics in target service:\n", p_char_disc_rsp->count);
-            }
+            printf("Service %d Characteristics (%d found):\n", current_service_index, p_char_disc_rsp->count);
             
-            // Process characteristics with proper UUID matching
+            // Process characteristics
             for (int i = 0; i < p_char_disc_rsp->count; i++) {
                 const ble_gattc_char_t* p_char = &(p_char_disc_rsp->chars[i]);
                 
-                // Get the 16-bit UUIDs from the original full UUIDs (bytes 12-13 in little-endian)
-                uint16_t target_write_uuid16 = (g_write_uuid[13] << 8) | g_write_uuid[12];
-                uint16_t target_response_uuid16 = (g_response_uuid[13] << 8) | g_response_uuid[12];
+                printf("  Char %d: Handle=0x%04X, Type=%u, UUID=0x%04X", 
+                       i, p_char->handle_value, p_char->uuid.type, p_char->uuid.uuid);
                 
-                // Match by UUID type AND 16-bit UUID
-                if (p_char->uuid.type == g_write_uuid_type && 
-                    p_char->uuid.uuid == target_write_uuid16) {
+                // Check for matches
+                bool is_write = (p_char->uuid.type == g_write_uuid_type);
+                bool is_response = (p_char->uuid.type == g_response_uuid_type);
+                
+                if (is_write) {
                     m_char_handle = p_char->handle_value;
-                    printf("✓ Found WRITE characteristic: Handle 0x%04X, UUID type %u, UUID 0x%04X\n", 
-                           m_char_handle, p_char->uuid.type, p_char->uuid.uuid);
+                    printf(" ← WRITE CHAR");
                 }
-                if (p_char->uuid.type == g_response_uuid_type && 
-                    p_char->uuid.uuid == target_response_uuid16) {
+                if (is_response) {
                     m_response_handle = p_char->handle_value;
-                    printf("✓ Found RESPONSE characteristic: Handle 0x%04X, UUID type %u, UUID 0x%04X\n", 
-                           m_response_handle, p_char->uuid.type, p_char->uuid.uuid);
+                    printf(" ← RESPONSE CHAR");
                 }
                 
-                if (g_verbose_debug) {
-                    printf("  Char %d: Handle 0x%04X, UUID type %u, UUID 0x%04X\n", 
-                           i, p_char->handle_value, p_char->uuid.type, p_char->uuid.uuid);
-                    print_uuid_by_type(p_char->uuid.type);
-                    printf("\n");
-                }
+                // Show properties
+                printf(" [");
+                if (p_char->char_props.read) printf("R");
+                if (p_char->char_props.write) printf("W");
+                if (p_char->char_props.write_wo_resp) printf("w");
+                if (p_char->char_props.notify) printf("N");
+                if (p_char->char_props.indicate) printf("I");
+                printf("]\n");
             }
             
-            // Continue or finish discovery...
+            // Continue or move to next service
             bool continue_current_service = false;
             if (p_char_disc_rsp->count > 0) {
                 uint16_t last_handle = p_char_disc_rsp->chars[p_char_disc_rsp->count-1].handle_decl;
@@ -397,29 +401,32 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             }
             
             if (!continue_current_service) {
-                printf("=== DISCOVERY COMPLETE ===\n");
-                printf("Write Handle: 0x%04X, Response Handle: 0x%04X\n", 
-                       m_char_handle, m_response_handle);
-                
-                // Send data if found
-                if (m_char_handle != 0 && g_send_data_len > 0) {
-                    printf("Sending data: %s\n", g_send_data);
-                    ble_gattc_write_params_t write_params = {
-                        .write_op = BLE_GATT_OP_WRITE_REQ,
-                        .flags = 0,
-                        .handle = m_char_handle,
-                        .offset = 0,
-                        .len = g_send_data_len,
-                        .p_value = g_send_data
+                current_service_index++;
+                if (current_service_index < total_services) {
+                    printf("\n--- DISCOVERING CHARACTERISTICS IN SERVICE %d ---\n", current_service_index);
+                    
+                    ble_gattc_handle_range_t handle_range = {
+                        .start_handle = discovered_services[current_service_index].handle_range.start_handle,
+                        .end_handle = discovered_services[current_service_index].handle_range.end_handle
                     };
-                    uint32_t err = sd_ble_gattc_write(adapter, m_conn_handle, &write_params);
-                    if (err != NRF_SUCCESS) {
-                        printf("❌ Write failed: %u\n", err);
-                    } else {
-                        printf("✓ Data sent successfully\n");
-                    }
+                    sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
                 } else {
-                    printf("❌ Write characteristic not found or no data\n");
+                    printf("\n=== DISCOVERY COMPLETE ===\n");
+                    printf("Found Handles: Write=0x%04X, Response=0x%04X\n", m_char_handle, m_response_handle);
+                    
+                    // Send data if found
+                    if (m_char_handle != 0 && g_send_data_len > 0) {
+                        printf("Sending data %s to write characteristic...\n", g_send_data);
+                        ble_gattc_write_params_t write_params = {
+                            .write_op = BLE_GATT_OP_WRITE_REQ,
+                            .flags = 0,
+                            .handle = m_char_handle,
+                            .offset = 0,
+                            .len = g_send_data_len,
+                            .p_value = g_send_data
+                        };
+                        sd_ble_gattc_write(adapter, m_conn_handle, &write_params);
+                    }
                 }
             }
             break;
@@ -663,6 +670,9 @@ int main(int argc, char* argv[])
        version.company_id);
         
     }
+    
+    // Set log handler to NULL to reduce debug noise
+    sd_rpc_log_handler_severity_filter_set(m_adapter, SD_RPC_LOG_ERROR);
     
     // Start scanning    
     printf("Starting scan...\n");
