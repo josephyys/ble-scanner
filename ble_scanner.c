@@ -418,7 +418,8 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
                     if (m_char_handle != 0 && g_send_data_len > 0) {
                         printf("Sending data %s to write characteristic...\n", g_send_data);
                         ble_gattc_write_params_t write_params = {
-                            .write_op = BLE_GATT_OP_WRITE_REQ,
+                            .write_op = BLE_GATT_OP_WRITE_CMD,  // Changed from WRITE_REQ to WRITE_CMD (no response)
+                            // .write_op = BLE_GATT_OP_WRITE_REQ,
                             .flags = 0,
                             .handle = m_char_handle,
                             .offset = 0,
