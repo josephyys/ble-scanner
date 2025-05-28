@@ -23,11 +23,13 @@ uint8_t g_response_uuid[16] = {0};
 uint8_t g_send_data[MAX_DATA_LEN] = {0};
 size_t g_send_data_len = 0;
 static bool g_verbose_debug= false;
+static bool g_decode_base64 = true; // Default to decoding base64
 
 // UUID type variables for registration
 static uint8_t g_service_uuid_type = 0;
 static uint8_t g_write_uuid_type = 0;
 static uint8_t g_response_uuid_type = 0;
+static bool g_operations_complete = false;
 
 // UUID registry for debugging
 struct uuid_registry_entry {
@@ -267,7 +269,10 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             const ble_gattc_evt_prim_srvc_disc_rsp_t* p_srvc_disc_rsp = 
                 &(p_ble_evt->evt.gattc_evt.params.prim_srvc_disc_rsp);
             
-            // Only show discovered services summary
+            // Look for target service in the response
+            bool target_service_found = false;
+            ble_gattc_service_t target_service;
+            
             for (int i = 0; i < p_srvc_disc_rsp->count; i++) {
                 printf("Service %d: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X", 
                     i,
@@ -279,71 +284,56 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
                 // Mark if it's our target service
                 if (p_srvc_disc_rsp->services[i].uuid.type == g_service_uuid_type) {
                     printf(" ← TARGET SERVICE");
+                    target_service = p_srvc_disc_rsp->services[i];
+                    target_service_found = true;
                 }
                 printf("\n");
-            }
-            
-            // Store services from EVERY response (not just the last one)
-            for (int i = 0; i < p_srvc_disc_rsp->count; i++) {
-                // Skip only the standard Bluetooth services (0x1800, 0x1801)
-                if (p_srvc_disc_rsp->services[i].uuid.uuid != 0x1800 && 
-                    p_srvc_disc_rsp->services[i].uuid.uuid != 0x1801 && 
-                    total_services < 10) {
-                    
-                    discovered_services[total_services] = p_srvc_disc_rsp->services[i];
-                    
-                    // Mark if this is our target service
-                    bool is_target = (p_srvc_disc_rsp->services[i].uuid.type == g_service_uuid_type);
-                    
-                    printf("Custom Service %d: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X%s\n", 
-                        total_services,
-                        discovered_services[total_services].uuid.type,
-                        discovered_services[total_services].uuid.uuid,
-                        discovered_services[total_services].handle_range.start_handle,
-                        discovered_services[total_services].handle_range.end_handle,
-                        is_target ? " ← TARGET" : "");
-                    
-                    total_services++;
+                
+                // Also store this service in our array for debugging purposes
+                if (total_services < 10) {
+                    discovered_services[total_services++] = p_srvc_disc_rsp->services[i];
                 }
             }
             
-            // Continue discovery if needed
-            if (p_srvc_disc_rsp->count > 0) {
+            // If target service found, stop service discovery and start characteristic discovery
+            if (target_service_found) {
+                printf("\n--- TARGET SERVICE FOUND - STOPPING SERVICE DISCOVERY ---\n");
+                printf("Target Service: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X\n",
+                       target_service.uuid.type,
+                       target_service.uuid.uuid,
+                       target_service.handle_range.start_handle,
+                       target_service.handle_range.end_handle);
+                
+                // Start characteristic discovery for the target service immediately
+                ble_gattc_handle_range_t handle_range = {
+                    .start_handle = target_service.handle_range.start_handle,
+                    .end_handle = target_service.handle_range.end_handle
+                };
+                
+                // Set current_service_index to 0 (the target service will be at index 0)
+                current_service_index = 0;
+                
+                // Only store the target service in our service array
+                discovered_services[0] = target_service;
+                total_services = 1;
+                
+                printf("\n--- DISCOVERING CHARACTERISTICS IN TARGET SERVICE ---\n");
+                sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
+                return; // Skip the rest of the function
+            }
+            
+            // If we didn't find the target service yet, continue service discovery
+            if (!target_service_found && p_srvc_disc_rsp->count > 0) {
                 uint16_t last_handle = p_srvc_disc_rsp->services[p_srvc_disc_rsp->count-1].handle_range.end_handle;
                 if (last_handle < 0xFFFF) {
                     sd_ble_gattc_primary_services_discover(adapter, m_conn_handle, last_handle + 1, NULL);
-                    return; // Continue discovery, don't start characteristics yet
+                    return; // Continue discovery
                 }
             }
             
-            // Discovery complete - now find and examine the target service
-            printf("\n--- FOUND %d CUSTOM SERVICES ---\n", total_services);
-            
-            // Start characteristic discovery for the TARGET service first
-            int target_service_index = -1;
-            for (int i = 0; i < total_services; i++) {
-                if (discovered_services[i].uuid.type == g_service_uuid_type) {
-                    target_service_index = i;
-                    break;
-                }
-            }
-
-            if (target_service_index >= 0) {
-                current_service_index = target_service_index;
-                printf("\n--- DISCOVERING CHARACTERISTICS IN TARGET SERVICE (Index %d) ---\n", target_service_index);
-                printf("Target Service: Type=%u, UUID=0x%04X, Handles=0x%04X-0x%04X\n",
-                       discovered_services[target_service_index].uuid.type,
-                       discovered_services[target_service_index].uuid.uuid,
-                       discovered_services[target_service_index].handle_range.start_handle,
-                       discovered_services[target_service_index].handle_range.end_handle);
-                
-                ble_gattc_handle_range_t handle_range = {
-                    .start_handle = discovered_services[target_service_index].handle_range.start_handle,
-                    .end_handle = discovered_services[target_service_index].handle_range.end_handle
-                };
-                sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
-            } else {
-                printf("❌ Target service not found in stored services!\n");
+            // If we reached this point, service discovery is complete but target not found
+            if (!target_service_found) {
+                printf("\n--- SERVICE DISCOVERY COMPLETE, TARGET SERVICE NOT FOUND ---\n");
             }
             break;
 }
@@ -401,32 +391,97 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             }
             
             if (!continue_current_service) {
-                current_service_index++;
-                if (current_service_index < total_services) {
-                    printf("\n--- DISCOVERING CHARACTERISTICS IN SERVICE %d ---\n", current_service_index);
-                    
-                    ble_gattc_handle_range_t handle_range = {
-                        .start_handle = discovered_services[current_service_index].handle_range.start_handle,
-                        .end_handle = discovered_services[current_service_index].handle_range.end_handle
+                // MOVED: Enable notifications for response characteristic here
+                if (m_response_handle != 0) {
+                    printf("Enabling notifications on response characteristic...\n");
+                    printf("CCCD Handle: 0x%04X\n", m_response_handle + 1);
+
+                    // Write to CCCD (Client Characteristic Configuration Descriptor)
+                    uint8_t notify_enable[] = {0x01, 0x00}; // Enable notifications
+
+                    ble_gattc_write_params_t cccd_write = {
+                        .write_op = BLE_GATT_OP_WRITE_REQ, // Write with response
+                        .flags = 0,
+                        .handle = m_response_handle + 1,  // CCCD handle is typically response_handle + 1
+                        .offset = 0,
+                        .len = sizeof(notify_enable),
+                        .p_value = notify_enable
                     };
-                    sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
-                } else {
-                    printf("\n=== DISCOVERY COMPLETE ===\n");
-                    printf("Found Handles: Write=0x%04X, Response=0x%04X\n", m_char_handle, m_response_handle);
-                    
-                    // Send data if found
-                    if (m_char_handle != 0 && g_send_data_len > 0) {
-                        printf("Sending data %s to write characteristic...\n", g_send_data);
-                        ble_gattc_write_params_t write_params = {
-                            .write_op = BLE_GATT_OP_WRITE_CMD,  // Changed from WRITE_REQ to WRITE_CMD (no response)
-                            // .write_op = BLE_GATT_OP_WRITE_REQ,
-                            .flags = 0,
-                            .handle = m_char_handle,
-                            .offset = 0,
-                            .len = g_send_data_len,
-                            .p_value = g_send_data
+
+                    uint32_t err = sd_ble_gattc_write(adapter, m_conn_handle, &cccd_write);
+                    if (err != NRF_SUCCESS) {
+                        printf("Failed to enable notifications, error: %u\n", err);
+                    } else {
+                        printf("Notifications enabled successfully\n");
+                        
+                        // Add this section to send the command right after enabling notifications 
+                        // instead of waiting for all services to be discovered
+                        if (m_char_handle != 0 && g_send_data_len > 0) {
+                            printf("\n=== SENDING COMMAND DATA ===\n");
+                            printf("Found Handles: Write=0x%04X, Response=0x%04X\n", m_char_handle, m_response_handle);
+                            
+                            uint8_t data_to_send[MAX_DATA_LEN];
+                            size_t data_len = 0;
+                            
+                            if (g_decode_base64) {
+                                // Decode base64 data
+                                data_len = base64_decode((char*)g_send_data, data_to_send, MAX_DATA_LEN);
+                                printf("Sending decoded base64 data (%zu bytes): ", data_len);
+                                for (int i = 0; i < data_len; i++) {
+                                    printf("%02X ", data_to_send[i]);
+                                }
+                                printf("\n");
+                            } else {
+                                // Use raw data
+                                data_len = g_send_data_len;
+                                memcpy(data_to_send, g_send_data, data_len);
+                                printf("Sending raw data %s to write characteristic...\n", g_send_data);
+                            }
+                            
+                            ble_gattc_write_params_t write_params = {
+                                .write_op = BLE_GATT_OP_WRITE_CMD,  // Write without response
+                                .flags = 0,
+                                .handle = m_char_handle,
+                                .offset = 0,
+                                .len = data_len,
+                                .p_value = data_to_send
+                            };
+                            sd_ble_gattc_write(adapter, m_conn_handle, &write_params);
+
+                            // Skip to the end of service discovery, we're done with the target service
+                            current_service_index = total_services;
+                        }
+                    }
+                }
+                
+                // Only continue to the next service if we're still processing services
+                if (current_service_index < total_services) {
+                    current_service_index++;
+                    if (current_service_index < total_services) {
+                        printf("\n--- DISCOVERING CHARACTERISTICS IN SERVICE %d ---\n", current_service_index);
+                        
+                        ble_gattc_handle_range_t handle_range = {
+                            .start_handle = discovered_services[current_service_index].handle_range.start_handle,
+                            .end_handle = discovered_services[current_service_index].handle_range.end_handle
                         };
-                        sd_ble_gattc_write(adapter, m_conn_handle, &write_params);
+                        sd_ble_gattc_characteristics_discover(adapter, m_conn_handle, &handle_range);
+                    } else {
+                        printf("\n=== DISCOVERY COMPLETE ===\n");
+                        printf("Found Handles: Write=0x%04X, Response=0x%04X\n", m_char_handle, m_response_handle);
+                        
+                        // Send data if found and not already sent
+                        if (m_char_handle != 0 && g_send_data_len > 0) {
+                            printf("Sending data %s to write characteristic...\n", g_send_data);
+                            ble_gattc_write_params_t write_params = {
+                                .write_op = BLE_GATT_OP_WRITE_CMD,  // Write without response
+                                .flags = 0,
+                                .handle = m_char_handle,
+                                .offset = 0,
+                                .len = g_send_data_len,
+                                .p_value = g_send_data
+                            };
+                            sd_ble_gattc_write(adapter, m_conn_handle, &write_params);
+                        }
                     }
                 }
             }
@@ -435,6 +490,12 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
         // Optionally, handle write response:
         case BLE_GATTC_EVT_WRITE_RSP: {
             printf("Write complete!\n");
+            
+            // If we're done with all operations, set the flag to exit the program
+            if (m_char_handle != 0 && m_response_handle != 0) {
+                printf("All operations completed successfully!\n");
+                g_operations_complete = true;
+            }
             break;
         }
         case BLE_GATTC_EVT_HVX: {
@@ -460,6 +521,12 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
                     }
                 }
                 printf("\n");
+                // Add custom logic to process the notification data
+                // Example: Check if the notification matches a specific transaction ID
+                // uint8_t expected_trans_id = ...; // Define your transaction ID logic
+                // if (hvx->data[0] == expected_trans_id) {
+                //     printf("Transaction ID matched!\n");
+                // }
             }
             break;
         }
@@ -534,6 +601,78 @@ void status_handler(adapter_t* adapter, sd_rpc_app_status_t status, const char* 
 }
 
 /**
+ * Simple Base64 decoder table
+ */
+static const unsigned char base64_table[256] = {
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 62, 64, 63,
+    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64,
+    64,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 63,
+    64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64
+};
+
+/**
+ * Base64 decoder
+ */
+int base64_decode(const char *in, uint8_t *out, int out_size) {
+    int i, j = 0, k;
+    uint32_t v;
+    size_t len = strlen(in);
+    
+    // Handle padding
+    if (len > 0 && in[len-1] == '=') len--;
+    if (len > 0 && in[len-1] == '=') len--;
+    
+    for (i = 0; i < len; i += 4) {
+        // Get values for each group of four base 64 characters
+        v = 0;
+        for (k = 0; k < 4 && i+k < len; k++) {
+            v = (v << 6) + base64_table[(unsigned char)in[i+k]];
+        }
+        
+        // Three bytes will be produced
+        if (j < out_size) out[j++] = (v >> 16) & 0xFF;
+        if (j < out_size && i+1 < len) out[j++] = (v >> 8) & 0xFF;
+        if (j < out_size && i+2 < len) out[j++] = v & 0xFF;
+    }
+    
+    return j;
+}
+
+// Helper function to add to registry
+void register_uuid_in_registry(uint8_t uuid_type, const char* description, const uint8_t* uuid_bytes) {
+    if (uuid_registry_count < 10) {
+        uuid_registry[uuid_registry_count].uuid_type = uuid_type;
+        uuid_registry[uuid_registry_count].description = description;
+        uuid_registry[uuid_registry_count].uuid_bytes = uuid_bytes;
+        uuid_registry_count++;
+    }
+}
+
+// Helper function to print UUID by type
+void print_uuid_by_type(uint8_t uuid_type) {
+    for (int i = 0; i < uuid_registry_count; i++) {
+        if (uuid_registry[i].uuid_type == uuid_type) {
+            printf("%s (", uuid_registry[i].description);
+            for (int j = 0; j < 16; j++) {
+                printf("%02X", uuid_registry[i].uuid_bytes[j]);
+                if (j == 3 || j == 5 || j == 7 || j == 9) printf("-");
+            }
+            printf(")");
+            return;
+        }
+    }
+    printf("Unknown UUID type %u", uuid_type);
+}
+
+/**
  * Main function
  */
 int main(int argc, char* argv[])
@@ -580,6 +719,12 @@ int main(int argc, char* argv[])
     if (argc > 7 && strcmp(argv[7], "-v") == 0) {
         g_verbose_debug = true;
         printf("Verbose debug mode enabled\n");
+    }
+
+    // Add this after the verbose flag check
+    if (argc > 8 && strcmp(argv[8], "-d") == 0) {
+        g_decode_base64 = true;
+        printf("Base64 decoding enabled\n");
     }
 
     // Add after parsing UUIDs from command line:
@@ -689,15 +834,21 @@ int main(int argc, char* argv[])
     
     m_scan_active = true;
     
-    // Scan for 30 seconds
-    printf("Scanning for 30 seconds...\n");
+    // Scan for up to 30 seconds
+    printf("Scanning for up to 30 seconds...\n");
     int scan_count = 0;
-    while (m_scan_active && scan_count < 30)
+    while (m_scan_active && scan_count < 30 && !g_operations_complete)
     {
         sleep(1);
         scan_count++;
         printf("Scanning... %d/30s\n", scan_count);
         fflush(stdout);
+        
+        // Add a check to exit if operations are complete
+        if (g_operations_complete) {
+            printf("Operations complete, exiting scan loop.\n");
+            break;
+        }
     }
     
     // Stop scanning
@@ -719,31 +870,4 @@ int main(int argc, char* argv[])
     printf("Application terminated\n");
     
     return 0;
-}
-
-
-// Helper function to add to registry
-void register_uuid_in_registry(uint8_t uuid_type, const char* description, const uint8_t* uuid_bytes) {
-    if (uuid_registry_count < 10) {
-        uuid_registry[uuid_registry_count].uuid_type = uuid_type;
-        uuid_registry[uuid_registry_count].description = description;
-        uuid_registry[uuid_registry_count].uuid_bytes = uuid_bytes;
-        uuid_registry_count++;
-    }
-}
-
-// Helper function to print UUID by type
-void print_uuid_by_type(uint8_t uuid_type) {
-    for (int i = 0; i < uuid_registry_count; i++) {
-        if (uuid_registry[i].uuid_type == uuid_type) {
-            printf("%s (", uuid_registry[i].description);
-            for (int j = 0; j < 16; j++) {
-                printf("%02X", uuid_registry[i].uuid_bytes[j]);
-                if (j == 3 || j == 5 || j == 7 || j == 9) printf("-");
-            }
-            printf(")");
-            return;
-        }
-    }
-    printf("Unknown UUID type %u", uuid_type);
 }
