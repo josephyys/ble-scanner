@@ -5,10 +5,13 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <time.h>  
 #include "sd_rpc.h"
 #include "ble.h"
 #include "ble_gattc.h"
 #include "ble_types.h"
+#include <termios.h>
+#include <fcntl.h>
 
 // Add base64 decoding (simple version)
 // #include <openssl/bio.h>
@@ -24,68 +27,13 @@ uint8_t g_send_data[MAX_DATA_LEN] = {0};
 size_t g_send_data_len = 0;
 static bool g_verbose_debug= false;
 static bool g_decode_base64 = true; // Default to decoding base64
-
-// UUID type variables for registration
-static uint8_t g_service_uuid_type = 0;
-static uint8_t g_write_uuid_type = 0;
-static uint8_t g_response_uuid_type = 0;
-static bool g_operations_complete = false;
-
-// UUID registry for debugging
-struct uuid_registry_entry {
-    uint8_t uuid_type;
-    const char* description;
-    const uint8_t* uuid_bytes;
-} uuid_registry[10];
-static int uuid_registry_count = 0;
-
-// Add this near your other global variables
-//static uint16_t m_service_end_handle = 0;
-
-// Helper: parse 128-bit UUID string to bytes (Nordic little-endian format)
-bool parse_uuid128(const char* uuid_str, uint8_t* uuid_bin) {
-    // UUID format: 81DFD14F-BFAA-40C8-BF69-41D8F7213D7A
-    unsigned int uuid_bytes[16];
-    int n = sscanf(uuid_str,
-        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        &uuid_bytes[0], &uuid_bytes[1], &uuid_bytes[2], &uuid_bytes[3],
-        &uuid_bytes[4], &uuid_bytes[5],
-        &uuid_bytes[6], &uuid_bytes[7],
-        &uuid_bytes[8], &uuid_bytes[9],
-        &uuid_bytes[10], &uuid_bytes[11], &uuid_bytes[12], &uuid_bytes[13], &uuid_bytes[14], &uuid_bytes[15]);
-    
-    if (n != 16) return false;
-    
-    // Convert to Nordic's little-endian format
-    // Reverse the entire UUID byte array
-    for (int i = 0; i < 16; ++i) {
-        uuid_bin[15-i] = (uint8_t)uuid_bytes[i];
-    }
-    return true;
-}
-
-// Helper: decode base64 to binary
-
-// Serial port configuration
-#define SERIAL_PORT     "/dev/ttyACM0"
-#define BAUD_RATE       1000000  // 1M baud
-
-// Add global for characteristic handle (set after discovery)
-static uint16_t m_char_handle = 0, m_response_handle = 0;
-
-// Store multiple services to check - MOVE THIS BEFORE ble_evt_handler
-static int current_service_index = 0;
-static ble_gattc_service_t discovered_services[10];
-static int total_services = 0;
-
-// Global variables
-adapter_t* m_adapter = NULL;
-bool m_scan_active = false;
-
-
-// Add a global for the target name
-char g_target_name[32] = "Target";
-
+static uint16_t m_cccd_handle = 0;
+static bool g_auto_send_enabled = true;
+static bool g_is_cccd_enabled = false;
+static bool g_connected = false;
+static bool g_discovery_complete = false;
+static bool g_command_sent = false;
+static uint16_t m_conn_handle = 0xFFFF;
 
 // Scan parameters
 ble_gap_scan_params_t m_scan_param = {
@@ -110,13 +58,285 @@ void print_uuid_by_type(uint8_t uuid_type);
 #include "ble_gattc.h"
 #include "ble_gap.h"
 
+
+// Serial port configuration
+#define SERIAL_PORT     "/dev/ttyACM0"
+#define BAUD_RATE       1000000  // 1M baud
+
+// Add global for characteristic handle (set after discovery)
+static uint16_t m_char_handle = 0, m_response_handle = 0;
+
+// Store multiple services to check - MOVE THIS BEFORE ble_evt_handler
+static int current_service_index = 0;
+static ble_gattc_service_t discovered_services[10];
+static int total_services = 0;
+
+// Global variables
+adapter_t* m_adapter = NULL;
+bool m_scan_active = false;
+
+
+// Add a global for the target name
+char g_target_name[32] = "Target";
+
+
+// Add this structure near your other globals
+typedef struct {
+    ble_gap_addr_t addr;
+    char name[32];
+    bool found;
+    int8_t rssi;
+} stored_device_t;
+
+static stored_device_t g_target_device = {0};
+
+// Add these near your other global variables
+uint16_t potential_cccd_handles[4] = {0}; // Will store potential handles
+int num_cccd_handles = 0;                 // Number of handles to try
+int current_cccd_index = 0;               // Current handle being tried
+bool cccd_discovery_complete = false;     // Flag to track if we've tried all handles
+
+// UUID type variables for registration
+static uint8_t g_service_uuid_type = 0;
+static uint8_t g_write_uuid_type = 0;
+static uint8_t g_response_uuid_type = 0;
+static bool g_operations_complete = false;
+static time_t g_notification_start_time = 0;
+static bool g_waiting_for_notification = false;
+static bool g_notification_received = false;
+
+// UUID registry for debugging
+struct uuid_registry_entry {
+    uint8_t uuid_type;
+    const char* description;
+    const uint8_t* uuid_bytes;
+} uuid_registry[10];
+static int uuid_registry_count = 0;
+
+// Add this near your other global variables
+//static uint16_t m_service_end_handle = 0;
+int base64_decode(const char *in, uint8_t *out, int out_size);
+
+
+// Function to connect to stored device
+void connect_to_stored_device() {
+    if (!g_target_device.found) {
+        printf("No target device stored!\n");
+        return;
+    }
+    
+    printf("\n=== CONNECTING TO STORED DEVICE ===\n");
+    printf("Connecting to: %s\n", g_target_device.name);
+    
+    // Reset connection flags
+    g_connected = false;
+    g_discovery_complete = false;
+    g_command_sent = false;
+    
+    ble_gap_conn_params_t conn_params = {
+        .min_conn_interval = 0x0028,
+        .max_conn_interval = 0x0038,
+        .slave_latency = 0,
+        .conn_sup_timeout = 400
+    };
+    
+    uint32_t err = sd_ble_gap_connect(m_adapter, &g_target_device.addr, &m_scan_param, &conn_params, 0);
+    if (err != NRF_SUCCESS) {
+        printf("Connect failed: %u\n", err);
+    }
+}
+
+// Function to disconnect
+void disconnect_device() {
+    if (m_conn_handle != 0xFFFF) {
+        printf("\n=== DISCONNECTING DEVICE ===\n");
+        uint32_t err = sd_ble_gap_disconnect(m_adapter, m_conn_handle, 0x13);  // Remote user terminated connection
+        if (err != NRF_SUCCESS) {
+            printf("Disconnect failed: %u\n", err);
+        }
+    }
+}
+// Simplified command send function (no CCCD re-enabling)
+void send_command_only() {
+    if (m_char_handle != 0 && g_send_data_len > 0) {
+        printf("\n=== SENDING COMMAND ===\n");
+        
+        uint8_t data_to_send[MAX_DATA_LEN];
+        size_t data_len = 0;
+        
+        if (g_decode_base64) {
+            data_len = base64_decode((char*)g_send_data, data_to_send, MAX_DATA_LEN);
+            printf("Sending decoded data (%zu bytes): ", data_len);
+            for (int i = 0; i < data_len; i++) {
+                printf("%02X ", data_to_send[i]);
+            }
+            printf("\n");
+        } else {
+            data_len = g_send_data_len;
+            memcpy(data_to_send, g_send_data, data_len);
+            printf("Sending raw data: %s\n", g_send_data);
+        }
+        
+        ble_gattc_write_params_t write_params = {
+            .write_op = BLE_GATT_OP_WRITE_CMD,
+            .flags = 0,
+            .handle = m_char_handle,
+            .offset = 0,
+            .len = data_len,
+            .p_value = data_to_send
+        };
+        
+        sd_ble_gattc_write(m_adapter, m_conn_handle, &write_params);
+        g_command_sent = true;
+        
+        // Start timeout for response
+        g_notification_start_time = time(NULL);
+        g_waiting_for_notification = true;
+        g_notification_received = false;
+    }
+}
+
+// Helper: parse 128-bit UUID string to bytes (Nordic little-endian format)
+bool parse_uuid128(const char* uuid_str, uint8_t* uuid_bin) {
+    // UUID format: 81DFD14F-BFAA-40C8-BF69-41D8F7213D7A
+    unsigned int uuid_bytes[16];
+    int n = sscanf(uuid_str,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        &uuid_bytes[0], &uuid_bytes[1], &uuid_bytes[2], &uuid_bytes[3],
+        &uuid_bytes[4], &uuid_bytes[5],
+        &uuid_bytes[6], &uuid_bytes[7],
+        &uuid_bytes[8], &uuid_bytes[9],
+        &uuid_bytes[10], &uuid_bytes[11], &uuid_bytes[12], &uuid_bytes[13], &uuid_bytes[14], &uuid_bytes[15]);
+    
+    if (n != 16) return false;
+    
+    // Convert to Nordic's little-endian format
+    // Reverse the entire UUID byte array
+    for (int i = 0; i < 16; ++i) {
+        uuid_bin[15-i] = (uint8_t)uuid_bytes[i];
+    }
+    return true;
+}
+
+
+// Function to make stdin non-blocking
+void set_stdin_nonblocking() {
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Function to check if a key was pressed (non-blocking)
+int kbhit() {
+    struct timeval tv = { 0L, 0L };
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    return select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+}
+
+
+// Add this function before your main()
+void try_next_cccd_handle(adapter_t* adapter, uint16_t conn_handle) {
+    if (current_cccd_index < num_cccd_handles) {
+        m_cccd_handle = potential_cccd_handles[current_cccd_index++];
+        printf("Trying to enable notifications on 0xC6A7 via CCCD at handle: 0x%04X (%d of %d)\n", 
+               m_cccd_handle, current_cccd_index, num_cccd_handles);
+        
+        uint8_t notify_enable[] = {0x01, 0x00};
+        ble_gattc_write_params_t cccd_write = {
+            .write_op = BLE_GATT_OP_WRITE_REQ,
+            .flags = 0,
+            .handle = m_cccd_handle,
+            .offset = 0,
+            .len = sizeof(notify_enable),
+            .p_value = notify_enable
+        };
+        
+        uint32_t err = sd_ble_gattc_write(adapter, conn_handle, &cccd_write);
+        if (err != NRF_SUCCESS) {
+            printf("Failed to write to handle 0x%04X, error: %u\n", m_cccd_handle, err);
+            try_next_cccd_handle(adapter, conn_handle);
+        } else {
+            printf("CCCD write request sent to handle 0x%04X\n", m_cccd_handle);
+        }
+    } else {
+        printf("Tried all %d potential CCCD handles without success\n", num_cccd_handles);
+        cccd_discovery_complete = true;
+        write_to_characteristic(adapter, conn_handle);
+    }
+}
+
+// Add this function to write to the write characteristic
+void write_to_characteristic(adapter_t* adapter, uint16_t conn_handle) {
+    // First re-enable notifications if needed
+    if (m_cccd_handle != 0 && m_response_handle != 0) {
+        printf("Re-enabling notifications before sending command...\n");
+        uint8_t notify_enable[] = {0x01, 0x00};
+        ble_gattc_write_params_t cccd_write = {
+            .write_op = BLE_GATT_OP_WRITE_REQ,
+            .flags = 0,
+            .handle = m_cccd_handle,
+            .offset = 0,
+            .len = sizeof(notify_enable),
+            .p_value = notify_enable
+        };
+        // sd_ble_gattc_write(adapter, conn_handle, &cccd_write);
+        // usleep(200000); // 100ms
+        // Small delay to allow notification to take effect
+        // g_is_cccd_enabled = false;
+        // while(1){
+        //     usleep(100000); // 100ms
+        //     if(g_is_cccd_enabled)
+        //         break;
+
+        // }
+    }
+
+    // Now send the actual command
+    if (m_char_handle != 0 && g_send_data_len > 0) {
+        printf("\n=== WRITING TO CHARACTERISTIC 0x0295 (Handle: 0x%04X) ===\n", m_char_handle);
+        
+        uint8_t data_to_send[MAX_DATA_LEN];
+        size_t data_len = 0;
+        
+        if (g_decode_base64) {
+            data_len = base64_decode((char*)g_send_data, data_to_send, MAX_DATA_LEN);
+            printf("Sending decoded base64 data (%zu bytes): ", data_len);
+            for (int i = 0; i < data_len; i++) {
+                printf("%02X ", data_to_send[i]);
+            }
+            printf("\n");
+        } else {
+            data_len = g_send_data_len;
+            memcpy(data_to_send, g_send_data, data_len);
+            printf("Sending raw data: %s\n", g_send_data);
+        }
+        
+        ble_gattc_write_params_t write_params = {
+            .write_op = BLE_GATT_OP_WRITE_CMD,  // Write without response
+            .flags = 0,
+            .handle = m_char_handle,
+            .offset = 0,
+            .len = data_len,
+            .flags = 0,
+            .handle = m_char_handle,
+            .p_value = data_to_send
+        };
+
+        sd_ble_gattc_write(adapter, conn_handle, &write_params);
+        printf("Data written to characteristic, now waiting for notifications...\n");
+        
+        // Set up notification monitoring
+        g_notification_start_time = time(NULL);
+        g_waiting_for_notification = true;
+        g_notification_received = false;
+    }
+}
+
 void to_lowercase(char* str) {
     for (; *str; ++str) *str = tolower(*str);
 }
 
-// Add global variables for connection
-static uint16_t m_conn_handle = 0xFFFF;
-static ble_gap_addr_t m_target_addr; // Set this when you find your target device
 
 
 // Add these function implementations before the main() function:
@@ -173,8 +393,13 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
     switch (evt_id) {
        
         case BLE_GAP_EVT_ADV_REPORT: {
-            const ble_gap_evt_adv_report_t* p_adv_report = &(p_ble_evt->evt.gap_evt.params.adv_report);
-            // print_adv_report(p_adv_report);  // Comment this out to reduce noise
+            const ble_gap_evt_adv_report_t* p_adv_report = &p_ble_evt->evt.gap_evt.params.adv_report;
+            
+            // Add NULL checks and bounds checking
+            if (p_adv_report->data == NULL || p_adv_report->dlen == 0) {
+                printf("Warning: Empty advertisement data\n");
+                break;
+            }
             
             // Connect to the first device found with the specified name
             const uint8_t* p_data = p_adv_report->data;
@@ -204,27 +429,29 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
                 pos += 1 + field_len;
             }
             if (found_name && strcmp(device_name, g_target_name) == 0) {
-                printf("Target device '%s' found, connecting...\n", g_target_name);
-                m_target_addr = p_adv_report->peer_addr;
+                printf("Target device '%s' found, storing device info...\n", g_target_name);
+                
+                // Store device information instead of connecting immediately
+                g_target_device.addr = p_adv_report->peer_addr;
+                strncpy(g_target_device.name, device_name, sizeof(g_target_device.name) - 1);
+                g_target_device.found = true;
+                g_target_device.rssi = p_adv_report->rssi;
+                
+                printf("Device stored: %s, RSSI: %d\n", g_target_device.name, g_target_device.rssi);
+                
+                // Stop scanning and exit scan loop
                 sd_ble_gap_scan_stop(adapter);
-                ble_gap_conn_params_t conn_params = {
-                    .min_conn_interval = 0x0028,
-                    .max_conn_interval = 0x0038,
-                    .slave_latency = 0,
-                    .conn_sup_timeout = 400
-                };
-                uint32_t err = sd_ble_gap_connect(adapter, &m_target_addr, &m_scan_param, &conn_params, 0);
-                if (err != NRF_SUCCESS) {
-                    printf("Connect failed: %u\n", err);
-                }
+                m_scan_active = false;
+                g_operations_complete = true;  // This will exit the scan loop
             }
             break;
         }
         case BLE_GAP_EVT_CONNECTED: {
     m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
-    printf("\n=== CONNECTED TO DEVICE ===\n");
+    g_connected = true;
+    printf("\n=== CONNECTED ===\n");
     printf("Connection Handle: 0x%04x\n", m_conn_handle);
-
+    
     // Register custom 128-bit UUIDs with Nordic SoftDevice
     uint32_t err;
     
@@ -237,6 +464,9 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
     service_base_uuid.uuid128[13] = 0x00;
     
     err = sd_ble_uuid_vs_add(m_adapter, &service_base_uuid, &g_service_uuid_type);
+    if (err != NRF_SUCCESS) {
+        printf("Failed to add service UUID, error: %u\n", err);
+    }
     printf("Service UUID -> Type: %u (16-bit: 0x%02X%02X)\n", 
            g_service_uuid_type, g_service_uuid[13], g_service_uuid[12]);
     
@@ -337,7 +567,46 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             }
             break;
 }
-        
+                
+        case BLE_GATTC_EVT_DESC_DISC_RSP: {
+            const ble_gattc_evt_desc_disc_rsp_t* p_desc_disc_rsp = 
+                &p_ble_evt->evt.gattc_evt.params.desc_disc_rsp;
+            
+            printf("Found %d descriptors\n", p_desc_disc_rsp->count);
+            
+            // Look for CCCD (UUID 0x2902)
+            for (int i = 0; i < p_desc_disc_rsp->count; i++) {
+                const ble_gattc_desc_t* p_desc = &p_desc_disc_rsp->descs[i];
+                
+                printf("  Descriptor %d: Handle=0x%04X, UUID=0x%04X\n", 
+                    i, p_desc->handle, p_desc->uuid.uuid);
+                
+                // Check if this is a CCCD (Client Characteristic Configuration Descriptor)
+                if (p_desc->uuid.uuid == 0x2902) {
+                    m_cccd_handle = p_desc->handle;
+                    printf("  Found CCCD at handle 0x%04X\n", m_cccd_handle);
+                    
+                    // Enable notifications here
+                    uint8_t notify_enable[] = {0x01, 0x00}; // Enable notifications
+                    ble_gattc_write_params_t cccd_write = {
+                        .write_op = BLE_GATT_OP_WRITE_REQ,
+                        .flags = 0,
+                        .handle = m_cccd_handle,
+                        .offset = 0,
+                        .len = sizeof(notify_enable),
+                        .p_value = notify_enable
+                    };
+                    
+                    uint32_t err = sd_ble_gattc_write(adapter, m_conn_handle, &cccd_write);
+                    if (err != NRF_SUCCESS) {
+                        printf("Failed to enable notifications, error: %u\n", err);
+                    } else {
+                        printf("Notification enable request sent, waiting for confirmation...\n");
+                    }
+                }
+            }
+            break;
+        }
         // After characteristic discovery, save handle and send data:
         case BLE_GATTC_EVT_CHAR_DISC_RSP: {
             const ble_gattc_evt_char_disc_rsp_t* p_char_disc_rsp = &(p_ble_evt->evt.gattc_evt.params.char_disc_rsp);
@@ -392,67 +661,74 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             
             if (!continue_current_service) {
                 // MOVED: Enable notifications for response characteristic here
-                if (m_response_handle != 0) {
-                    printf("Enabling notifications on response characteristic...\n");
-                    printf("CCCD Handle: 0x%04X\n", m_response_handle + 1);
+                // After discovering characteristics and finding your notification characteristic:
+// In your BLE_GATTC_EVT_CHAR_DISC_RSP handler, after finding the response handle:
+if (m_response_handle != 0) {
+    // Set up potential CCCD handles to try
+    num_cccd_handles = 0;
+    
+    // Standard location (handle + 1)
+    potential_cccd_handles[num_cccd_handles++] = m_response_handle + 1;
+    
+    // Some devices have it at handle + 2
+    potential_cccd_handles[num_cccd_handles++] = m_response_handle + 2;
+    
+    // Try handle - 1 (rare but possible)
+    if (m_response_handle > 1) {
+        potential_cccd_handles[num_cccd_handles++] = m_response_handle - 1;
+    }
+    
+    // Add the service end handle too (some devices have unusual layouts)
+    potential_cccd_handles[num_cccd_handles++] = 
+        discovered_services[current_service_index].handle_range.end_handle;
+    
+    // Start with the first potential handle
+    current_cccd_index = 0;
+    cccd_discovery_complete = false;
+    
+    // Try the first handle
+    printf("Testing multiple potential CCCD handles...\n");
+    try_next_cccd_handle(adapter, m_conn_handle);
+}                
+// if (m_response_handle != 0) {
+//     printf("Discovering descriptors for response characteristic...\n");
+    
+//     // Set handle range for descriptor discovery
+//     ble_gattc_handle_range_t desc_range = {
+//         .start_handle = m_response_handle + 1,
+//         .end_handle = discovered_services[current_service_index].handle_range.end_handle
+//     };
+    
+//     // Discover descriptors
+//     uint32_t err = sd_ble_gattc_descriptors_discover(adapter, m_conn_handle, &desc_range);
+//     if (err != NRF_SUCCESS) {
+//         printf("Failed to start descriptor discovery, error: %u\n", err);
+//     }
+// }
+                // if (m_response_handle != 0) {
+                //     printf("Enabling notifications on response characteristic...\n");
+                //     m_cccd_handle = m_response_handle + 1;  // Save the CCCD handle
+                //     printf("CCCD Handle: 0x%04X\n", m_cccd_handle);
 
-                    // Write to CCCD (Client Characteristic Configuration Descriptor)
-                    uint8_t notify_enable[] = {0x01, 0x00}; // Enable notifications
+                //     // Write to CCCD (Client Characteristic Configuration Descriptor)
+                //     uint8_t notify_enable[] = {0x01, 0x00}; // Enable notifications
 
-                    ble_gattc_write_params_t cccd_write = {
-                        .write_op = BLE_GATT_OP_WRITE_REQ, // Write with response
-                        .flags = 0,
-                        .handle = m_response_handle + 1,  // CCCD handle is typically response_handle + 1
-                        .offset = 0,
-                        .len = sizeof(notify_enable),
-                        .p_value = notify_enable
-                    };
+                //     ble_gattc_write_params_t cccd_write = {
+                //         .write_op = BLE_GATT_OP_WRITE_REQ, // Write with response
+                //         .flags = 0,
+                //         .handle = m_cccd_handle,  // CCCD handle
+                //         .offset = 0,
+                //         .len = sizeof(notify_enable),
+                //         .p_value = notify_enable
+                //     };
 
-                    uint32_t err = sd_ble_gattc_write(adapter, m_conn_handle, &cccd_write);
-                    if (err != NRF_SUCCESS) {
-                        printf("Failed to enable notifications, error: %u\n", err);
-                    } else {
-                        printf("Notifications enabled successfully\n");
-                        
-                        // Add this section to send the command right after enabling notifications 
-                        // instead of waiting for all services to be discovered
-                        if (m_char_handle != 0 && g_send_data_len > 0) {
-                            printf("\n=== SENDING COMMAND DATA ===\n");
-                            printf("Found Handles: Write=0x%04X, Response=0x%04X\n", m_char_handle, m_response_handle);
-                            
-                            uint8_t data_to_send[MAX_DATA_LEN];
-                            size_t data_len = 0;
-                            
-                            if (g_decode_base64) {
-                                // Decode base64 data
-                                data_len = base64_decode((char*)g_send_data, data_to_send, MAX_DATA_LEN);
-                                printf("Sending decoded base64 data (%zu bytes): ", data_len);
-                                for (int i = 0; i < data_len; i++) {
-                                    printf("%02X ", data_to_send[i]);
-                                }
-                                printf("\n");
-                            } else {
-                                // Use raw data
-                                data_len = g_send_data_len;
-                                memcpy(data_to_send, g_send_data, data_len);
-                                printf("Sending raw data %s to write characteristic...\n", g_send_data);
-                            }
-                            
-                            ble_gattc_write_params_t write_params = {
-                                .write_op = BLE_GATT_OP_WRITE_CMD,  // Write without response
-                                .flags = 0,
-                                .handle = m_char_handle,
-                                .offset = 0,
-                                .len = data_len,
-                                .p_value = data_to_send
-                            };
-                            sd_ble_gattc_write(adapter, m_conn_handle, &write_params);
-
-                            // Skip to the end of service discovery, we're done with the target service
-                            current_service_index = total_services;
-                        }
-                    }
-                }
+                //     uint32_t err = sd_ble_gattc_write(adapter, m_conn_handle, &cccd_write);
+                //     if (err != NRF_SUCCESS) {
+                //         printf("Failed to enable notifications, error: %u\n", err);
+                //     } else {
+                //         printf("Notification enable request sent, waiting for confirmation...\n");
+                //     }
+                // }
                 
                 // Only continue to the next service if we're still processing services
                 if (current_service_index < total_services) {
@@ -487,46 +763,142 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             }
             break;
         }
+        // case 0x0011: // BLE_GATTC_EVT_WRITE_CMD_RSP
+        // {
+        //     printf("Write command response received (0x0011)\n");
+        //     const uint16_t handle = p_ble_evt->evt.gattc_evt.params.write_rsp.handle;  // <-- CHANGED HERE
+        //     printf("Write confirmed for handle: 0x%04X\n", handle);
+            
+        //     // If this is our command characteristic, just acknowledge
+        //     if (handle == m_char_handle) {
+        //         printf("Command write confirmed\n");
+        //     }
+        //     break;
+        // }
         // Optionally, handle write response:
         case BLE_GATTC_EVT_WRITE_RSP: {
-            printf("Write complete!\n");
+
+            const uint16_t handle = p_ble_evt->evt.gattc_evt.params.write_rsp.handle;
+            g_is_cccd_enabled = true;
+            printf("Write response received for handle: 0x%04X\n", handle);
             
-            // If we're done with all operations, set the flag to exit the program
-            if (m_char_handle != 0 && m_response_handle != 0) {
-                printf("All operations completed successfully!\n");
-                g_operations_complete = true;
+            if (handle == m_cccd_handle) {
+                printf("Successfully enabled notifications on 0xC6A7 via CCCD at handle 0x%04X\n", m_cccd_handle);
+                
+                // Only auto-send the first time, not for subsequent CCCD re-enables
+                if (g_auto_send_enabled) {
+                    write_to_characteristic(adapter, m_conn_handle);
+                    g_auto_send_enabled = false; // Disable auto-send after first command
+                } else {
+                    printf("CCCD re-enabled, ready for manual command sending\n");
+                }
             }
             break;
         }
-        case BLE_GATTC_EVT_HVX: {
-            const ble_gattc_evt_hvx_t* hvx = &p_ble_evt->evt.gattc_evt.params.hvx;
-            printf("Notification received from handle: 0x%04X\n", hvx->handle);
+        // Add this case to handle BLE_GATTC_EVT_WRITE_CMD_TX_COMPLETE (0x003C)
+        case BLE_GATTC_EVT_WRITE_CMD_TX_COMPLETE: {
+            printf("Write command transmission complete\n");
+            break;
+        }
+        // Add this case to handle BLE_GATTC_EVT_NOTIFICATION (0x001F)
+        // case BLE_GATTC_EVT_NOTIFICATION: {
+        //     // This is the event code 0x001F
+        //     const ble_gattc_evt_hvx_t* p_notification = &p_ble_evt->evt.gattc_evt.params.hvx;
             
-            // Check if this is from our response characteristic
-            if (hvx->handle == m_response_handle) {
-                printf("Notification from response characteristic: ");
-                // Print the notification data as hex
-                for (int i = 0; i < hvx->len; i++) {
-                    printf("%02X ", hvx->data[i]);
+        //     printf("\n!!! NOTIFICATION RECEIVED (event: 0x001F, length: %d) !!!\n", p_notification->len);
+        //     printf("Notification from handle: 0x%04X (expecting: 0xC6A7)\n", 
+        //            p_notification->handle, m_response_handle);
+            
+        //     // Dump raw data in hex format
+        //     printf("RAW DATA (hex): ");
+        //     for (int i = 0; i < p_notification->len; i++) {
+        //         printf("%02X ", p_notification->data[i]);
+        //     }
+        //     printf("\n");
+            
+        //     // Also print as ASCII where possible
+        //     printf("ASCII DATA: ");
+        //     for (int i = 0; i < p_notification->len; i++) {
+        //         if (isprint(p_notification->data[i])) {
+        //             printf("%c", p_notification->data[i]);
+        //         } else {
+        //             printf(".");
+        //         }
+        //     }
+        //     printf("\n");
+            
+        //     g_notification_received = true;
+        //     break;
+        // }
+        // Add this special case handler to directly match the notification event ID
+        case 0x001F: // HVX/notification handler
+    {
+        const ble_gattc_evt_hvx_t* p_hvx = &p_ble_evt->evt.gattc_evt.params.hvx;
+        
+        printf("\n!!! NOTIFICATION RECEIVED !!!\n");
+        printf("Notification from handle: 0x%04X (our response char: 0x%04X)\n", 
+            p_hvx->handle, m_response_handle);
+        
+        // Always print notification data
+        printf("Data (%d bytes): ", p_hvx->len);
+        for (int i = 0; i < p_hvx->len; i++) {
+            printf("%02X ", p_hvx->data[i]);
+        }
+        printf("\n");
+        
+        // ASCII representation
+        printf("ASCII: ");
+        for (int i = 0; i < p_hvx->len; i++) {
+            if (isprint(p_hvx->data[i])) {
+                printf("%c", p_hvx->data[i]);
+            } else {
+                printf(".");
+            }
+        }
+        printf("\n");
+        
+        // Mark received if it's from our response characteristic
+        if (p_hvx->handle == m_response_handle) {
+            printf("✓ Response received from 0xC6A7, disconnecting...\n");
+            g_notification_received = true;
+            
+            // Auto-disconnect after receiving response (like your mobile app)
+            usleep(500000);  // Brief delay (500ms)
+            disconnect_device();
+        } else {
+            printf("⚠ This is from a different characteristic (not 0xC6A7)\n");
+        }
+        break;
+    }
+            // Handle notification events            
+        case BLE_GATTC_EVT_HVX: {
+            const ble_gattc_evt_hvx_t* p_hvx = &p_ble_evt->evt.gattc_evt.params.hvx;
+            printf("\n!!! NOTIFICATION RECEIVED (length: %d) !!!\n", p_hvx->len);
+            printf("Notification from handle: 0x%04X (expecting: 0x%04X)\n", 
+                   p_hvx->handle, m_response_handle);
+            
+            if (p_hvx->handle == m_response_handle) {
+                printf("Response data (%d bytes): ", p_hvx->len);
+                for (int i = 0; i < p_hvx->len; i++) {
+                    printf("%02X ", p_hvx->data[i]);
                 }
                 printf("\n");
                 
-                // Also try to print as ASCII if possible
+                // Also try to print as ASCII if it might be text
                 printf("ASCII: ");
-                for (int i = 0; i < hvx->len; i++) {
-                    if (isprint(hvx->data[i])) {
-                        printf("%c", hvx->data[i]);
+                for (int i = 0; i < p_hvx->len; i++) {
+                    if (isprint(p_hvx->data[i])) {
+                        printf("%c", p_hvx->data[i]);
                     } else {
                         printf(".");
                     }
                 }
                 printf("\n");
-                // Add custom logic to process the notification data
-                // Example: Check if the notification matches a specific transaction ID
-                // uint8_t expected_trans_id = ...; // Define your transaction ID logic
-                // if (hvx->data[0] == expected_trans_id) {
-                //     printf("Transaction ID matched!\n");
-                // }
+
+                // Add this line to set the notification received flag
+                g_notification_received = true;
+    
+                // Don't exit here - wait for possible additional notifications
             }
             break;
         }
@@ -546,8 +918,35 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             }
             break;
         }
-
+        case BLE_GAP_EVT_DISCONNECTED: {
+    printf("\n=== DISCONNECTED ===\n");
+    
+    // Reset all connection-related variables
+    m_conn_handle = 0xFFFF;
+    g_connected = false;
+    g_discovery_complete = false;
+    g_command_sent = false;
+    g_waiting_for_notification = false;
+    g_notification_received = false;
+    g_auto_send_enabled = true;  // Re-enable for next connection
+    
+    // Reset handles
+    m_char_handle = 0;
+    m_response_handle = 0;
+    m_cccd_handle = 0;
+    
+    // Reset discovery state
+    current_service_index = 0;
+    total_services = 0;
+    cccd_discovery_complete = false;
+    current_cccd_index = 0;
+    num_cccd_handles = 0;
+    
+    printf("Ready for next command\n");
+    break;
+}
         default:
+            printf("Unhandled BLE event: 0x%04X\n", evt_id);
             break;
     }
 }
@@ -823,18 +1222,16 @@ int main(int argc, char* argv[])
     // Start scanning    
     printf("Starting scan...\n");
     error_code = sd_ble_gap_scan_start(m_adapter, &m_scan_param);
-    // error_code = sd_ble_gap_scan_start(m_adapter, &m_scan_param, &scan_data);
-    if (error_code != NRF_SUCCESS)
-    {
+    if (error_code != NRF_SUCCESS) {
         printf("Failed to start scanning, error: %d\n", error_code);
         sd_rpc_close(m_adapter);
         sd_rpc_adapter_delete(m_adapter);
         return 1;
     }
-    
-    m_scan_active = true;
-    
-    // Scan for up to 30 seconds
+
+    // Add this line to set the scan as active
+    m_scan_active = true;  // <-- ADD THIS LINE
+
     printf("Scanning for up to 30 seconds...\n");
     int scan_count = 0;
     while (m_scan_active && scan_count < 30 && !g_operations_complete)
@@ -849,6 +1246,20 @@ int main(int argc, char* argv[])
             printf("Operations complete, exiting scan loop.\n");
             break;
         }
+        // In your main scanning loop:
+        if (g_waiting_for_notification) {
+            time_t current_time = time(NULL);
+            if (current_time - g_notification_start_time > 2) // Shorter timeout for CCCD testing
+                {
+                printf("No notification received with current CCCD handle\n");
+                g_waiting_for_notification = false;
+                
+                // Try the next handle if we haven't received a notification
+                if (!g_notification_received && !cccd_discovery_complete) {
+                    try_next_cccd_handle(m_adapter, m_conn_handle);
+                }
+            }
+        }
     }
     
     // Stop scanning
@@ -858,6 +1269,53 @@ int main(int argc, char* argv[])
     {
         printf("Failed to stop scanning, error: %d\n", error_code);
     }
+
+    // Enable interactive mode
+    if (g_target_device.found) {
+    printf("\n=== INTERACTIVE MODE ===\n");
+    printf("Device stored: %s\n", g_target_device.name);
+    printf("Press ENTER to send command, 'q' to quit\n");
+    
+    set_stdin_nonblocking();
+    bool interactive_mode = true;
+    
+    while (interactive_mode) {
+        // Handle timeouts during connection/command
+        if (g_waiting_for_notification && g_connected) {  // Only check timeout if connected
+            time_t current_time = time(NULL);
+            if (current_time - g_notification_start_time > 10) {
+                printf("Timeout - disconnecting...\n");
+                disconnect_device();
+                // Don't set g_waiting_for_notification = false here, let disconnect handler do it
+            }
+        }
+        
+        // Check for keypress
+        if (kbhit()) {
+            int ch = getchar();
+            if (ch == 'q' || ch == 'Q') {
+                printf("Exiting...\n");
+                if (g_connected) {
+                    disconnect_device();
+                    sleep(1);
+                }
+                interactive_mode = false;
+            } else if (ch == '\n') {
+                if (!g_connected) {  // Only connect if not already connected
+                    printf("Connecting and sending command...\n");
+                    connect_to_stored_device();
+                } else {
+                    printf("Already connected, please wait for completion or timeout...\n");
+                }
+            }
+        }
+        
+        usleep(50000);
+    }
+} else {
+    printf("No target device found during scan!\n");
+}
+    
     
     // Close and clean up
     error_code = sd_rpc_close(m_adapter);
