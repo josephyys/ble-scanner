@@ -41,7 +41,59 @@ static uint8_t g_cccd_value = 0;  // Start with notifications disabled
 static bool g_first_command_sent = false;
 static bool g_waiting_for_user_input = false;
 #define BLE_CCCD_NOTIFY                      0x01
+// Add these near your other global variables:
+// Update your operation mode enum:
+typedef enum {
+    MODE_IDLE,
+    MODE_DISCOVERY_ONLY,
+    MODE_SEND_COMMAND,
+    MODE_MANUAL_SEND_NO_CCCD    // ← New mode: no CCCD, just send command
+} operation_mode_t;
 
+// Add these to suppress unused variable warnings:
+// (void)g_first_command_sent;
+// (void)g_waiting_for_user_input;
+// (void)g_actual_notification_handle;
+// (void)g_handles_verified;
+// (void)g_is_cccd_enabled;
+// (void)g_auto_send_enabled;
+
+// Add this helper function near the top of your file:
+void print_timestamp() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_nsec / 1000000;
+    printf("[%ld.%03ld] ", ts.tv_sec, ms);
+}
+
+// Add this macro for timestamped logging:
+#define LOG_WITH_TIME(format, ...) do { \
+    print_timestamp(); \
+    printf(format, ##__VA_ARGS__); \
+} while(0)
+
+static operation_mode_t g_current_mode = MODE_IDLE;
+static bool g_discovery_completed = false;
+static time_t g_discovery_start_time = 0;
+static time_t g_command_start_time = 0;
+
+// Add this near your other global variables (around line 50):
+static bool continue_discovery = false;
+
+// Add this macro near the top of your file after includes:
+#define LOG_SD_BLE_CALL(api_call, description) do { \
+    printf("🔧 API CALL: %s - %s\n", #api_call, description); \
+    uint32_t _err = (api_call); \
+    printf("   Result: %s (0x%08X)\n", _err == NRF_SUCCESS ? "SUCCESS" : "ERROR", _err); \
+    if (_err != NRF_SUCCESS) { \
+        printf("   ❌ API FAILED: %s returned error 0x%08X\n", #api_call, _err); \
+    } \
+    _err; \
+} while(0)
+
+// Separate timeouts for different operations
+#define DISCOVERY_TIMEOUT_SECONDS 15
+#define COMMAND_TIMEOUT_SECONDS 10
 // Scan parameters
 ble_gap_scan_params_t m_scan_param = {
     .active = 1,            // Active scanning (will send scan requests)
@@ -129,9 +181,9 @@ int base64_decode(const char *in, uint8_t *out, int out_size);
 static uint32_t response_cccd_set(uint8_t value)
 {
     ble_gattc_write_params_t write_params;
-    uint8_t cccd_value[2] = {value, 0};  // Like main.c
+    uint8_t cccd_value[2] = {value, 0};
 
-    printf("✅ Setting Response CCCD to: %s (0x%02X) to handle  (0x%04X) \n", 
+    printf("✅ Setting Response CCCD to: %s (0x%02X) to handle (0x%04X)\n", 
            value ? "ENABLED" : "DISABLED", value, m_cccd_handle);
 
     if (m_cccd_handle == 0) {
@@ -142,10 +194,15 @@ static uint32_t response_cccd_set(uint8_t value)
     write_params.handle   = m_cccd_handle;
     write_params.len      = 2;
     write_params.p_value  = cccd_value;
-    write_params.write_op = BLE_GATT_OP_WRITE_REQ;  // Same as main.c
+    write_params.write_op = BLE_GATT_OP_WRITE_REQ;
     write_params.offset   = 0;
+    write_params.flags= 0;
 
-    return sd_ble_gattc_write(m_adapter, m_conn_handle, &write_params);
+    // ✅ FIX API LOGGING:
+    uint32_t result;
+    LOG_SD_BLE_CALL(result = sd_ble_gattc_write(m_adapter, m_conn_handle, &write_params), "CCCD Enable Write Request");
+
+    return result;  
 }
 // Function to connect to stored device
 void connect_to_stored_device() {
@@ -169,7 +226,8 @@ void connect_to_stored_device() {
         .conn_sup_timeout = 400
     };
     
-    uint32_t err = sd_ble_gap_connect(m_adapter, &g_target_device.addr, &m_scan_param, &conn_params, 0);
+    uint32_t err;
+    LOG_SD_BLE_CALL(err = sd_ble_gap_connect(m_adapter, &g_target_device.addr, &m_scan_param, &conn_params, 0), "GAP Connect Request");
     if (err != NRF_SUCCESS) {
         printf("Connect failed: %u\n", err);
     }
@@ -199,7 +257,8 @@ static uint32_t descr_discovery_start()
 void disconnect_device() {
     if (m_conn_handle != 0xFFFF) {
         printf("\n=== DISCONNECTING DEVICE ===\n");
-        uint32_t err = sd_ble_gap_disconnect(m_adapter, m_conn_handle, 0x13);  // Remote user terminated connection
+        uint32_t err;
+LOG_SD_BLE_CALL(err = sd_ble_gap_disconnect(m_adapter, m_conn_handle, 0x13), "Disconnect Request");
         if (err != NRF_SUCCESS) {
             printf("Disconnect failed: %u\n", err);
         }
@@ -227,7 +286,7 @@ void send_command_only() {
         }
         
         ble_gattc_write_params_t write_params = {
-            .write_op = BLE_GATT_OP_WRITE_CMD,
+            .write_op = BLE_GATT_OP_WRITE_REQ, //BLE_GATT_OP_WRITE_CMD,
             .flags = 0,
             .handle = m_char_handle,
             .offset = 0,
@@ -366,7 +425,7 @@ void write_to_characteristic(adapter_t* adapter, uint16_t conn_handle) {
         }
         
         ble_gattc_write_params_t write_params = {
-            .write_op = BLE_GATT_OP_WRITE_CMD,  // Write without response
+            .write_op =BLE_GATT_OP_WRITE_REQ,// BLE_GATT_OP_WRITE_CMD,  // Write without response
             .flags = 0,
             .handle = m_char_handle,
             .offset = 0,
@@ -443,7 +502,24 @@ void trim_trailing_whitespace(char* str)
 // 1. In your adv_report handler, save the address of the device you want to connect to
 void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
     uint16_t evt_id = p_ble_evt->header.evt_id;
-     printf("🎯 check all EVENT:  (0x%04X)\n", evt_id);
+    
+    // ✅ ADD TIMESTAMP TO EVERY EVENT
+    print_timestamp();
+    printf("🎯 EVENT: 0x%04X ", evt_id);
+    
+    // Add human-readable event names
+    switch(evt_id) {
+        case 0x0010: printf("(BLE_GAP_EVT_CONNECTED)\n"); break;
+        case 0x0011: printf("(BLE_GAP_EVT_DISCONNECTED)\n"); break;
+        case 0x001F: printf("(UNKNOWN/HVX/TIMEOUT?)\n"); break;
+        case 0x0023: printf("(UNKNOWN)\n"); break;
+        case 0x0032: printf("(BLE_GATTC_EVT_CHAR_DISC_RSP)\n"); break;
+        case 0x0033: printf("(BLE_GATTC_EVT_DESC_DISC_RSP)\n"); break;
+        case 0x0038: printf("(BLE_GATTC_EVT_WRITE_RSP)\n"); break;
+        case 0x003C: printf("(BLE_GATTC_EVT_WRITE_CMD_TX_COMPLETE)\n"); break;
+        case 0x0055: printf("(UNKNOWN)\n"); break;
+        default: printf("(UNKNOWN)\n"); break;
+    }
 
     switch (evt_id) {
        
@@ -502,91 +578,113 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
             break;
         }
         case BLE_GAP_EVT_CONNECTED: {
-    m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
-    g_connected = true;
-    printf("\n=== CONNECTED ===\n");
-    printf("Connection Handle: 0x%04x\n", m_conn_handle);
+            m_conn_handle = p_ble_evt->evt.gap_evt.conn_handle;
+            g_connected = true;
+            printf("\n=== CONNECTED ===\n");
+            printf("Connection Handle: 0x%04x\n", m_conn_handle);
+            printf("Operation Mode: %s\n", 
+                g_current_mode == MODE_DISCOVERY_ONLY ? "DISCOVERY ONLY" :
+                g_current_mode == MODE_SEND_COMMAND ? "SEND COMMAND" :
+                g_current_mode == MODE_MANUAL_SEND_NO_CCCD ? "MANUAL SEND (NO CCCD)" : "IDLE");
+            
+            // Check for existing handles
+            if (m_char_handle != 0 && m_response_handle != 0 && m_cccd_handle != 0) {
+                printf("🎯 USING PREVIOUSLY DISCOVERED HANDLES:\n");
+                printf("   Write Handle: 0x%04X\n", m_char_handle);
+                printf("   Response Handle: 0x%04X\n", m_response_handle);
+                printf("   CCCD Handle: 0x%04X\n", m_cccd_handle);
+                
+                if (g_current_mode == MODE_DISCOVERY_ONLY) {
+                    printf("Discovery mode: Handles already known, disconnecting immediately\n");
+                    disconnect_device();
+                    return;
+                } else if (g_current_mode == MODE_SEND_COMMAND) {
+                    printf("🚀 Send mode: SKIPPING ALL DISCOVERY - going straight to command\n");
+                    g_command_start_time = time(NULL);
+                    
+                    printf("Enabling CCCD and sending command directly...\n");
+                    uint32_t err = response_cccd_set(BLE_CCCD_NOTIFY);
+                    if (err != NRF_SUCCESS) {
+                        printf("❌ Failed to enable CCCD, error: %u\n", err);
+                    }
+                    return;
+                } else if (g_current_mode == MODE_MANUAL_SEND_NO_CCCD) {
+                    printf("🔧 MANUAL SEND (NO CCCD): SKIPPING CCCD - sending command directly\n");
+                    g_command_start_time = time(NULL);
+                    
+                    // Skip CCCD entirely - go straight to command
+                    printf("⚠️ SKIPPING CCCD ENABLE - sending command without notifications setup\n");
+                    force_send_command();
+                    return;
+                }
+            }
+    // ✅ ONLY DO DISCOVERY IF HANDLES ARE NOT KNOWN
+    printf("⚠️ Handles not known, proceeding with discovery...\n");
     
-    // Register custom 128-bit UUIDs with Nordic SoftDevice
-    uint32_t err;
-    
-    printf("\n=== DETAILED UUID REGISTRATION AND VERIFICATION ===\n");
-    
-    // Verify our target response UUID matches Expo app
-    printf("\nTarget Response UUID from Expo app: a07cc6a7-c0d6-4ac8-add4-8d692f3e9803\n");
-    printf("Our parsed Response UUID: ");
-    for (int i = 15; i >= 0; i--) {  // Print in standard format (reverse of Nordic)
-        printf("%02x", g_response_uuid[i]);
-        if (i == 12 || i == 10 || i == 8 || i == 6) printf("-");
+    if (g_current_mode == MODE_DISCOVERY_ONLY) {
+        printf("🔍 Starting DISCOVERY ONLY mode\n");
+        g_discovery_start_time = time(NULL);
+    } else if (g_current_mode == MODE_SEND_COMMAND) {
+        printf("🚀 Starting SEND COMMAND mode with discovery\n");
+        g_command_start_time = time(NULL);
     }
-    printf("\n");
     
-    // Service UUID Registration
-    printf("\n--- SERVICE UUID REGISTRATION ---\n");
-    ble_uuid128_t service_base_uuid;
-    memcpy(service_base_uuid.uuid128, g_service_uuid, 16);
-    service_base_uuid.uuid128[12] = 0x00;  // Clear 16-bit part
-    service_base_uuid.uuid128[13] = 0x00;
+    // UUID REGISTRATION AND DISCOVERY CODE (only when needed)
+    printf("\n=== UUID REGISTRATION ===\n");
     
-    print_detailed_uuid_info("SERVICE UUID BEFORE REGISTRATION", g_service_uuid, 0);
+    // Register service UUID
+    // ble_uuid128_t service_uuid = { {0}, BLE_UUID_TYPE_128 };
     
-    err = sd_ble_uuid_vs_add(m_adapter, &service_base_uuid, &g_service_uuid_type);
-    if (err != NRF_SUCCESS) {
-        printf("❌ Failed to add service UUID, error: %u\n", err);
+// ✅ CORRECT - Use BLE_UUID_TYPE_VENDOR_BEGIN or BLE_UUID_TYPE_UNKNOWN:
+ble_uuid128_t service_uuid = { {0}, BLE_UUID_TYPE_VENDOR_BEGIN };
+// OR
+// ble_uuid128_t service_uuid = { {0}, BLE_UUID_TYPE_UNKNOWN };
+    memcpy(service_uuid.uuid128, g_service_uuid, 16);
+    uint32_t err = sd_ble_uuid_vs_add(m_adapter, &service_uuid, &g_service_uuid_type);
+    if (err == NRF_SUCCESS) {
+        printf("✅ Service UUID registered as type %u\n", g_service_uuid_type);
+        register_uuid_in_registry(g_service_uuid_type, "Service UUID", g_service_uuid);
     } else {
-        printf("✅ Service UUID registered successfully\n");
-        print_detailed_uuid_info("SERVICE UUID AFTER REGISTRATION", g_service_uuid, g_service_uuid_type);
+        printf("❌ Failed to register service UUID, error: %u\n", err);
     }
     
-    // Write UUID Registration
-    printf("\n--- WRITE UUID REGISTRATION ---\n");
-    ble_uuid128_t write_base_uuid;
-    memcpy(write_base_uuid.uuid128, g_write_uuid, 16);
-    write_base_uuid.uuid128[12] = 0x00;
-    write_base_uuid.uuid128[13] = 0x00;
-    
-    print_detailed_uuid_info("WRITE UUID BEFORE REGISTRATION", g_write_uuid, 0);
-    
-    err = sd_ble_uuid_vs_add(m_adapter, &write_base_uuid, &g_write_uuid_type);
-    if (err != NRF_SUCCESS) {
-        printf("❌ Failed to add write UUID, error: %u\n", err);
+    // Register write UUID  
+    ble_uuid128_t write_uuid = { {0}, BLE_UUID_TYPE_VENDOR_BEGIN };
+    memcpy(write_uuid.uuid128, g_write_uuid, 16);
+    err = sd_ble_uuid_vs_add(m_adapter, &write_uuid, &g_write_uuid_type);
+    if (err == NRF_SUCCESS) {
+        printf("✅ Write UUID registered as type %u\n", g_write_uuid_type);
+        register_uuid_in_registry(g_write_uuid_type, "Write UUID", g_write_uuid);
     } else {
-        printf("✅ Write UUID registered successfully\n");
-        print_detailed_uuid_info("WRITE UUID AFTER REGISTRATION", g_write_uuid, g_write_uuid_type);
+        printf("❌ Failed to register write UUID, error: %u\n", err);
     }
     
-    // Response UUID Registration (CRITICAL - this is what we need to verify)
-    printf("\n--- RESPONSE UUID REGISTRATION (CRITICAL) ---\n");
-    ble_uuid128_t response_base_uuid;
-    memcpy(response_base_uuid.uuid128, g_response_uuid, 16);
-    response_base_uuid.uuid128[12] = 0x00;
-    response_base_uuid.uuid128[13] = 0x00;
-    
-    print_detailed_uuid_info("RESPONSE UUID BEFORE REGISTRATION", g_response_uuid, 0);
-    printf("Expected to match Expo app: a07cc6a7-c0d6-4ac8-add4-8d692f3e9803\n");
-    
-    err = sd_ble_uuid_vs_add(m_adapter, &response_base_uuid, &g_response_uuid_type);
-    if (err != NRF_SUCCESS) {
-        printf("❌ CRITICAL: Failed to add response UUID, error: %u\n", err);
+    // Register response UUID
+    ble_uuid128_t response_uuid = { {0}, BLE_UUID_TYPE_VENDOR_BEGIN };
+    memcpy(response_uuid.uuid128, g_response_uuid, 16);
+    err = sd_ble_uuid_vs_add(m_adapter, &response_uuid, &g_response_uuid_type);
+    if (err == NRF_SUCCESS) {
+        printf("✅ Response UUID registered as type %u\n", g_response_uuid_type);
+        register_uuid_in_registry(g_response_uuid_type, "Response UUID", g_response_uuid);
     } else {
-        printf("✅ Response UUID registered successfully\n");
-        print_detailed_uuid_info("RESPONSE UUID AFTER REGISTRATION", g_response_uuid, g_response_uuid_type);
-        
-        // Show what we'll be looking for during discovery
-        printf("\n🔍 DISCOVERY MATCHING CRITERIA:\n");
-        printf("During characteristic discovery, we will look for:\n");
-        printf("  - Characteristic with UUID Type: %u\n", g_response_uuid_type);
-        printf("  - Characteristic with 16-bit UUID: 0x%02X%02X\n", g_response_uuid[13], g_response_uuid[12]);
-        printf("  - This should match the response characteristic from Expo app\n");
+        printf("❌ Failed to register response UUID, error: %u\n", err);
     }
-
-    printf("\n=== UUID REGISTRATION SUMMARY ===\n");
-    printf("Service UUID Type: %u -> 16-bit: 0x%02X%02X\n", g_service_uuid_type, g_service_uuid[13], g_service_uuid[12]);
-    printf("Write UUID Type: %u -> 16-bit: 0x%02X%02X\n", g_write_uuid_type, g_write_uuid[13], g_write_uuid[12]);
-    printf("Response UUID Type: %u -> 16-bit: 0x%02X%02X\n", g_response_uuid_type, g_response_uuid[13], g_response_uuid[12]);
-
+    
     printf("\n--- STARTING SERVICE DISCOVERY ---\n");
     sd_ble_gattc_primary_services_discover(m_adapter, m_conn_handle, 0x0001, NULL);
+
+    printf("\n=== UUID REGISTRATION DEBUG ===\n");
+    printf("Service UUID Type: %u\n", g_service_uuid_type);
+    printf("Write UUID Type: %u\n", g_write_uuid_type);  
+    printf("Response UUID Type: %u\n", g_response_uuid_type);
+    printf("Service UUID bytes: ");
+    for (int i = 0; i < 16; i++) printf("%02X ", g_service_uuid[i]);
+    printf("\nWrite UUID bytes: ");
+    for (int i = 0; i < 16; i++) printf("%02X ", g_write_uuid[i]);
+    printf("\nResponse UUID bytes: ");
+    for (int i = 0; i < 16; i++) printf("%02X ", g_response_uuid[i]);
+    printf("\n");
+
     break;
 }
         // After service discovery, discover characteristics:
@@ -710,33 +808,38 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
                 }
             }
             
-            if (!cccd_found) {
-                printf("❌ NO CCCD FOUND in descriptor discovery!\n");
-                printf("Trying manual CCCD setup at 0x%04X (response_handle + 1)\n", m_response_handle + 1);
+            if (cccd_found) {
+                printf("✅ FOUND REAL CCCD at handle 0x%04X\n", m_cccd_handle);
+                g_discovery_completed = true;
                 
-                // Fallback: try the standard location
-                m_cccd_handle = m_response_handle + 1; // 0x0012 + 1 = 0x0013
-                
-                uint8_t notify_enable[] = {0x01, 0x00};
-                ble_gattc_write_params_t cccd_write = {
-                    .write_op = BLE_GATT_OP_WRITE_REQ,
-                    .flags = 0,
-                    .handle = m_cccd_handle,
-                    .offset = 0,
-                    .len = sizeof(notify_enable),
-                    .p_value = notify_enable
-                };
-                
-                uint32_t err = sd_ble_gattc_write(m_adapter, m_conn_handle, &cccd_write);
-                if (err != NRF_SUCCESS) {
-                    printf("Manual CCCD setup FAILED at 0x%04X, error: %u\n", m_cccd_handle, err);
-                } else {
-                    printf("Manual CCCD setup attempted at 0x%04X\n", m_cccd_handle);
+                // Handle based on operation mode
+                if (g_current_mode == MODE_DISCOVERY_ONLY) {
+                    printf("\n🎉 DISCOVERY ONLY COMPLETE!\n");
+                    printf("Discovered handles:\n");
+                    printf("  - Write Handle: 0x%04X\n", m_char_handle);
+                    printf("  - Response Handle: 0x%04X\n", m_response_handle);
+                    printf("  - CCCD Handle: 0x%04X\n", m_cccd_handle);
+                    printf("Disconnecting (discovery only mode)...\n");
+                    disconnect_device();
+                    return;
+                } else if (g_current_mode == MODE_SEND_COMMAND) {
+                    printf("\n🚀 DISCOVERY COMPLETE, PROCEEDING TO COMMAND\n");
+                    // Enable CCCD and send command
+                    uint32_t err = response_cccd_set(BLE_CCCD_NOTIFY);
+                    if (err != NRF_SUCCESS) {
+                        printf("❌ Failed to set CCCD, error: %u\n", err);
+                    }
+                }
+            } else {
+                // Handle CCCD not found based on mode
+                if (g_current_mode == MODE_DISCOVERY_ONLY) {
+                    printf("❌ DISCOVERY FAILED: No CCCD found\n");
+                    disconnect_device();
+                } else if (g_current_mode == MODE_SEND_COMMAND) {
+                    printf("⚠️ No CCCD found, attempting command anyway\n");
+                    force_send_command();
                 }
             }
-            //
-            usleep(1000000);
-            force_send_command();
             break;
         }
         // After characteristic discovery, save handle and send data:
@@ -763,51 +866,28 @@ void ble_evt_handler(adapter_t* adapter, ble_evt_t* p_ble_evt) {
                 if (p_char->char_props.indicate) printf("INDICATE ");
                 printf("\n");
                 
-                // Special focus on handle 0x00A0 (where notifications came from)
-                if (p_char->handle_value == 0x00A0) {
-                    printf("🎯 FOUND HANDLE 0x00A0 - THIS IS WHERE NOTIFICATIONS CAME FROM!\n");
-                    printf("   UUID: 0x%04X, Type: %u\n", p_char->uuid.uuid, p_char->uuid.type);
-                    if (p_char->char_props.notify) {
-                        printf("   ✅ This characteristic supports NOTIFICATIONS!\n");
-                        printf("   🔥 THIS IS THE REAL RESPONSE CHARACTERISTIC!\n");
-                        // Force assignment for testing
-                        printf("   FORCING assignment as response characteristic\n");
-                        m_response_handle = 0x00A0;
-                    }
-                }
-                
-                // Check for our target characteristics
-                if (p_char->uuid.type == g_write_uuid_type) {
+                // ✅ FIX: Only assign if UUID type matches AND handle not already assigned
+                if (p_char->uuid.type == g_write_uuid_type && m_char_handle == 0) {
                     m_char_handle = p_char->handle_value;
-                    printf("✅ WRITE CHARACTERISTIC: Handle 0x%04X\n", m_char_handle);
+                    printf("✅ WRITE CHARACTERISTIC: Handle 0x%04X (UUID Type %u)\n", 
+                           m_char_handle, p_char->uuid.type);
                 }
                 
-                if (p_char->uuid.type == g_response_uuid_type) {
-                    printf("✅ TARGET RESPONSE CHARACTERISTIC: Handle 0x%04X\n", p_char->handle_value);
-                    // Only assign if we haven't found the 0x00A0 one
-                    if (m_response_handle == 0) {
-                        m_response_handle = p_char->handle_value;
-                    }
+                if (p_char->uuid.type == g_response_uuid_type && m_response_handle == 0) {
+                    m_response_handle = p_char->handle_value;
+                    printf("✅ RESPONSE CHARACTERISTIC: Handle 0x%04X (UUID Type %u)\n", 
+                           m_response_handle, p_char->uuid.type);
                 }
                 
-                // Look for ANY notification-capable characteristics
-                if (p_char->char_props.notify) {
-                    printf("📡 NOTIFICATION-CAPABLE: Handle 0x%04X, UUID 0x%04X\n", 
-                           p_char->handle_value, p_char->uuid.uuid);
-                }
-                
-                // Look for characteristics near handle 0x00A0
-                if (p_char->handle_value >= 0x009F && p_char->handle_value <= 0x00A5) {
-                    printf("🔍 NEAR 0x00A0: Handle 0x%04X, UUID 0x%04X, Props: %s%s%s\n",
-                           p_char->handle_value, p_char->uuid.uuid,
-                           p_char->char_props.notify ? "NOTIFY " : "",
-                           p_char->char_props.write ? "WRITE " : "",
-                           p_char->char_props.read ? "READ " : "");
-                }
+                // Debug: Show what we're looking for
+                printf("Looking for: Write UUID Type %u, Response UUID Type %u\n", 
+                       g_write_uuid_type, g_response_uuid_type);
             }
             
-            // Continue discovery if more characteristics exist
-            bool continue_discovery = false;
+            // ✅ ADD THIS MISSING CONTINUATION LOGIC:
+            // Reset continue_discovery flag
+            continue_discovery = false;
+            
             if (p_char_disc_rsp->count > 0) {
                 uint16_t last_value_handle = 0;
                 for (int i = 0; i < p_char_disc_rsp->count; i++) {
@@ -842,27 +922,19 @@ if (!continue_discovery) {
         uint32_t err = descr_discovery_start();
         if (err != NRF_SUCCESS) {
             printf("❌ ERROR: Failed to start descriptor discovery, error: %u\n", err);
-            // Fallback: try manual CCCD setup
-            printf("Falling back to manual CCCD setup...\n");
-            m_cccd_handle = m_response_handle + 1;
-            
-            uint8_t notify_enable[] = {0x01, 0x00};
-            ble_gattc_write_params_t cccd_write = {
-                .write_op = BLE_GATT_OP_WRITE_REQ,
-                .flags = 0,
-                .handle = m_cccd_handle,
-                .offset = 0,
-                .len = sizeof(notify_enable),
-                .p_value = notify_enable
-            };
-            sd_ble_gattc_write(m_adapter, m_conn_handle, &cccd_write);
         }
     } else {
         printf("❌ ERROR: Response characteristic not found!\n");
-        // Force command anyway to test write characteristic
-        if (m_char_handle != 0) {
-            printf("Attempting to send command without notifications...\n");
-            force_send_command();
+        
+        // Handle based on mode
+        if (g_current_mode == MODE_DISCOVERY_ONLY) {
+            printf("Discovery mode: Disconnecting after failed discovery\n");
+            disconnect_device();
+        } else if (g_current_mode == MODE_SEND_COMMAND) {
+            printf("Command mode: Attempting command without notifications\n");
+            if (m_char_handle != 0) {
+                force_send_command();
+            }
         }
     }
 }
@@ -884,26 +956,28 @@ if (!continue_discovery) {
         case BLE_GATTC_EVT_WRITE_RSP: {
 
             const uint16_t handle = p_ble_evt->evt.gattc_evt.params.write_rsp.handle;
-            g_is_cccd_enabled = true;
             printf("Write response received for handle: 0x%04X\n", handle);
             
             if (handle == m_cccd_handle) {
-                printf("Successfully enabled notifications on 0xC6A7 via CCCD at handle 0x%04X\n", m_cccd_handle);
+                printf("✅ CCCD %s successfully!\n", g_cccd_value ? "ENABLED" : "DISABLED");
                 
-                // Only auto-send the first time, not for subsequent CCCD re-enables
-                /*
-                if (g_auto_send_enabled) {
-                    write_to_characteristic(adapter, m_conn_handle);
-                    g_auto_send_enabled = false; // Disable auto-send after first command
+                // ✅ ADD THIS CRITICAL FIX: Call tx_process after CCCD write response
+                print_timestamp();
+                // printf("🔧 Calling sd_ble_gattc_tx_process to flush TX queue...\n");
+                // uint32_t tx_err = sd_ble_gattc_tx_process(m_adapter, m_conn_handle);
+                // if (tx_err == NRF_SUCCESS) {
+                //     printf("✅ TX process completed successfully\n");
+                // } else {
+                //     printf("⚠️ TX process failed: 0x%08X\n", tx_err);
+                // }
+                
+                // Only send command in SEND_COMMAND mode
+                if (g_current_mode == MODE_SEND_COMMAND) {
+                    printf("CCCD enabled, sending command...\n");
+                    force_send_command();
                 } else {
-                    printf("CCCD re-enabled, ready for manual command sending\n");
+                    printf("Discovery mode: CCCD enabled but not sending command\n");
                 }
-                    */
-                // Just confirm CCCD is ready
-        printf("CCCD enabled, ready for notifications from 0x%04X\n", m_response_handle);
-                // Force send command
-                force_send_command();
-
             }
             break;
         }
@@ -945,45 +1019,40 @@ if (!continue_discovery) {
     //     break;
     // }
             // Handle notification events  BLE_GATTC_EVT_HVX  0x001F          
-        case BLE_GATTC_EVT_HVX: {
+        case 0x0039: {  // BLE_GATTC_EVT_HVX - The REAL notification event!
+            print_timestamp();
+            printf("!!! REAL NOTIFICATION EVENT 0x0039 (BLE_GATTC_EVT_HVX) !!!\n");
+            
             const ble_gattc_evt_hvx_t* p_hvx = &p_ble_evt->evt.gattc_evt.params.hvx;
-    
-    printf("\n!!! NOTIFICATION RECEIVED !!!\n");
-    printf("Handle: 0x%04X, Expected: 0x%04X, CCCD: 0x%04X\n", 
-           p_hvx->handle, m_response_handle, m_cccd_handle);
-    
-    // Use main.c style range check
-    if (p_hvx->handle == m_response_handle) {
-        printf("✅ Notification from correct response characteristic!\n");
-        
-        printf("Data (%d bytes): ", p_hvx->len);
-        for (int i = 0; i < p_hvx->len; i++) {
-            printf("%02X ", p_hvx->data[i]);
-        }
-        printf("\n");
-        
-        g_notification_received = true;
-        disconnect_device();
-    }
-    else if (p_hvx->handle >= m_response_handle && p_hvx->handle <= m_cccd_handle) {
-        printf("📝 Notification from related handle in service range\n");
-        printf("Data: ");
-        for (int i = 0; i < p_hvx->len && i < 20; i++) {
-            printf("%02X ", p_hvx->data[i]);
-        }
-        printf("\n");
-    }
-    else {
-        printf("📝 Un-parsed data received on handle: 0x%04X\n", p_hvx->handle);
-    }
-    break;
-}
-        case BLE_GATTC_EVT_READ_RSP: {
-            // Read response received
-            printf("Read response received!\n");
-            // Parse p_ble_evt->evt.gattc_evt.params.read_rsp.data
+            
+            print_timestamp();
+            printf("Notification Handle: 0x%04X, Length: %d bytes\n", p_hvx->handle, p_hvx->len);
+            print_timestamp();
+            printf("Type: %s\n", p_hvx->type == BLE_GATT_HVX_NOTIFICATION ? "NOTIFICATION" : "INDICATION");
+            
+            if (p_hvx->handle == 0x00A0 || p_hvx->handle == m_response_handle) {
+                print_timestamp();
+                printf("🎉 REAL NOTIFICATION RECEIVED from handle 0x%04X!\n", p_hvx->handle);
+                
+                print_timestamp();
+                printf("Response data (%d bytes):\n", p_hvx->len);
+                for (int i = 0; i < p_hvx->len; i++) {
+                    printf("%02X ", p_hvx->data[i]);
+                    if ((i + 1) % 16 == 0) printf("\n");
+                }
+                printf("\n");
+                
+                g_notification_received = true;
+                print_timestamp();
+                printf("🎉 COMMAND SUCCESSFUL - Real notification received!\n");
+                disconnect_device();
+            } else {
+                print_timestamp();
+                printf("📝 Notification from unexpected handle: 0x%04X\n", p_hvx->handle);
+            }
             break;
         }
+        // Keep 0x001F as GAP event handler:
         case BLE_GAP_EVT_TIMEOUT:
         {
             const ble_gap_evt_timeout_t* p_timeout = &(p_ble_evt->evt.gap_evt.params.timeout);
@@ -996,31 +1065,69 @@ if (!continue_discovery) {
         }
         case BLE_GAP_EVT_DISCONNECTED: {
     printf("\n=== DISCONNECTED ===\n");
+    printf("Mode was: %s\n", 
+           g_current_mode == MODE_DISCOVERY_ONLY ? "DISCOVERY ONLY" :
+           g_current_mode == MODE_SEND_COMMAND ? "SEND COMMAND" : "IDLE");
     
-    // Reset all connection-related variables
+    // Reset connection-related variables
     m_conn_handle = 0xFFFF;
     g_connected = false;
-    g_discovery_complete = false;
-    g_command_sent = false;
     g_waiting_for_notification = false;
     g_notification_received = false;
-    g_auto_send_enabled = true;  // Re-enable for next connection
     
-    // Reset handles
-    m_char_handle = 0;
-    m_response_handle = 0;
-    m_cccd_handle = 0;
+    // Reset mode
+    g_current_mode = MODE_IDLE;
     
-    // Reset discovery state
-    current_service_index = 0;
-    total_services = 0;
-    cccd_discovery_complete = false;
-    current_cccd_index = 0;
-    num_cccd_handles = 0;
+    // ✅ ALWAYS KEEP HANDLES - Never clear them once discovered
+    if (g_discovery_completed && m_char_handle != 0 && m_response_handle != 0 && m_cccd_handle != 0) {
+        printf("✅ Discovery was successful, KEEPING handles for next operation:\n");
+        printf("   Write Handle: 0x%04X\n", m_char_handle);
+        printf("   Response Handle: 0x%04X\n", m_response_handle);
+        printf("   CCCD Handle: 0x%04X\n", m_cccd_handle);
+    } else {
+        printf("Discovery was incomplete, clearing handles\n");
+        m_char_handle = 0;
+        m_response_handle = 0;
+        m_cccd_handle = 0;
+        g_discovery_completed = false;  // Reset discovery flag
+    }
     
-    printf("Ready for next command\n");
+    printf("Ready for next command ('d' for discovery, 's' for send command)\n");
     break;
 }
+        // Add this case in your ble_evt_handler switch statement, BEFORE the default case:
+        case 0x001F: {
+    print_timestamp();
+    printf("!!! GAP EVENT 0x001F (Connection Parameter Update or similar) !!!\n");
+    print_timestamp();
+    printf("This is a GAP layer event, not related to notifications\n");
+    // Don't disconnect - this is not an error
+    break;
+}
+
+//         case 0x001F: {
+//     printf("\n!!! EVENT 0x001F RECEIVED (TIMEOUT) !!!\n");
+    
+//     // Try to cast as notification data first
+//     const ble_gattc_evt_hvx_t* p_hvx = &p_ble_evt->evt.gattc_evt.params.hvx;
+    
+//     printf("Handle: 0x%04X, Length: %d bytes\n", p_hvx->handle, p_hvx->len);
+//     printf("Data: ");
+//     for (int i = 0; i < p_hvx->len && i < 20; i++) {
+//         printf("%02X ", p_hvx->data[i]);
+//     }
+//     printf("\n");
+    
+//     // Check if this matches expected response handle
+//     if (p_hvx->handle == m_response_handle || p_hvx->handle == 0x00A0) {
+//         printf("✅ This appears to be response data from 0x%04X!\n", p_hvx->handle);
+//         g_notification_received = true;
+//         disconnect_device();
+//     } else {
+//         printf("⚠️ This appears to be a timeout event, not notification data\n");
+//     }
+//     break;
+// }
         default:
             printf("Unhandled BLE event: 0x%04X\n", evt_id);
             break;
@@ -1385,19 +1492,44 @@ int main(int argc, char* argv[])
     if (g_target_device.found) {
     printf("\n=== INTERACTIVE MODE ===\n");
     printf("Device stored: %s\n", g_target_device.name);
-    printf("Press ENTER to send command, 'q' to quit\n");
+    printf("Commands:\n");
+    printf("  'd' - Discovery only (find handles)\n");
+    printf("  's' - Send command (with CCCD enable)\n");
+    printf("  'm' - Manual send (NO CCCD, direct command only)\n");  // ← New option
+    printf("  'q' - Quit\n");
     
     set_stdin_nonblocking();
     bool interactive_mode = true;
     
     while (interactive_mode) {
-        // Handle timeouts during connection/command
-        if (g_waiting_for_notification && g_connected) {  // Only check timeout if connected
+        //sd_rpc_process_events(m_adapter);
+        //sd_rpc_conn_continue(m_adapter);
+        // Handle discovery timeout
+        if (g_current_mode == MODE_DISCOVERY_ONLY && g_connected) {
             time_t current_time = time(NULL);
-            if (current_time - g_notification_start_time > 10) {
-                printf("Timeout - disconnecting...\n");
+            if (current_time - g_discovery_start_time > DISCOVERY_TIMEOUT_SECONDS) {
+                printf("Discovery timeout (%d seconds) - disconnecting...\n", DISCOVERY_TIMEOUT_SECONDS);
                 disconnect_device();
-                // Don't set g_waiting_for_notification = false here, let disconnect handler do it
+            }
+        }
+        
+        // Handle command timeout
+        if (g_current_mode == MODE_SEND_COMMAND && g_connected && g_waiting_for_notification) {
+            time_t current_time = time(NULL);
+            time_t elapsed = current_time - g_command_start_time;
+            
+            if (elapsed > COMMAND_TIMEOUT_SECONDS) {
+                print_timestamp();
+                printf("Command timeout (%ld seconds elapsed) - disconnecting...\n", elapsed);
+                disconnect_device();
+            }
+            
+            // Print periodic status
+            static time_t last_status_time = 0;
+            if (current_time - last_status_time >= 2) {  // Every 2 seconds
+                print_timestamp();
+                printf("Waiting for response... (%ld/%d seconds)\n", elapsed, COMMAND_TIMEOUT_SECONDS);
+                last_status_time = current_time;
             }
         }
         
@@ -1411,19 +1543,38 @@ int main(int argc, char* argv[])
                     sleep(1);
                 }
                 interactive_mode = false;
-            } else if (ch == '\n') {
-                if (!g_connected) {  // Only connect if not already connected
-                    printf("Connecting and sending command...\n");
+            } else if (ch == 'd' || ch == 'D') {
+                if (!g_connected) {
+                    printf("🔍 Starting DISCOVERY ONLY mode...\n");
+                    g_current_mode = MODE_DISCOVERY_ONLY;
                     connect_to_stored_device();
                 } else {
-                    printf("Already connected, please wait for completion or timeout...\n");
+                    printf("Already connected, please wait or press 'q' to quit\n");
+                }
+            } else if (ch == 's' || ch == 'S') {
+                if (!g_connected) {
+                    printf("🚀 Starting SEND COMMAND mode...\n");
+                    g_current_mode = MODE_SEND_COMMAND;
+                    connect_to_stored_device();
+                } else {
+                    printf("Already connected, please wait or press 'q' to quit\n");
+                }
+            // Add manual mode handler
+            } else if (ch == 'm' || ch == 'M') {
+                if (!g_connected) {
+                    printf("🔧 Starting MANUAL SEND (NO CCCD) mode...\n");
+                    g_current_mode = MODE_MANUAL_SEND_NO_CCCD;
+                    connect_to_stored_device();
+                } else {
+                    printf("Already connected, please wait or press 'q' to quit\n");
                 }
             }
         }
         
         usleep(50000);
     }
-} else {
+}
+else {
     printf("No target device found during scan!\n");
 }
     
@@ -1441,47 +1592,54 @@ int main(int argc, char* argv[])
     return 0;
 }
 
-// Add this function to force command sending
 void force_send_command() {
-    if (m_char_handle != 0 && g_send_data_len > 0) {
-        printf("\n🚀 FORCE SENDING COMMAND TO WRITE CHARACTERISTIC 0x%04X\n", m_char_handle);
-        
-        uint8_t data_to_send[MAX_DATA_LEN];
-        size_t data_len = 0;
-        
-        if (g_decode_base64) {
-            data_len = base64_decode((char*)g_send_data, data_to_send, MAX_DATA_LEN);
-            printf("Decoded data (%zu bytes): ", data_len);
-            for (int i = 0; i < data_len; i++) {
-                printf("%02X ", data_to_send[i]);
-            }
-            printf("\n");
-        } else {
-            data_len = g_send_data_len;
-            memcpy(data_to_send, g_send_data, data_len);
+    print_timestamp();
+    printf("🚀 FORCE SENDING COMMAND TO WRITE CHARACTERISTIC 0x%04X\n", m_char_handle);
+    
+    uint8_t data_to_send[MAX_DATA_LEN];
+    size_t data_len = 0;
+    
+    if (g_decode_base64) {
+        data_len = base64_decode((char*)g_send_data, data_to_send, MAX_DATA_LEN);
+        printf("Decoded data (%zu bytes): ", data_len);
+        for (int i = 0; i < data_len; i++) {
+            printf("%02X ", data_to_send[i]);
         }
-        
-        ble_gattc_write_params_t write_params = {
-            .write_op = BLE_GATT_OP_WRITE_CMD,  // Write without response
-            .flags = 0,
-            .handle = m_char_handle,
-            .offset = 0,
-            .len = data_len,
-            .p_value = data_to_send
-        };
-        
-        uint32_t err = sd_ble_gattc_write(m_adapter, m_conn_handle, &write_params);
-        if (err != NRF_SUCCESS) {
-            printf("❌ Write failed with error: %u\n", err);
-        } else {
-            printf("✅ Command sent successfully!\n");
-            
-            // Set up notification monitoring
-            g_notification_start_time = time(NULL);
-            g_waiting_for_notification = true;
-            g_notification_received = false;
-        }
+        printf("\n");
     } else {
-        printf("❌ Cannot send command: write_handle=0x%04X, data_len=%zu\n", m_char_handle, g_send_data_len);
+        data_len = g_send_data_len;
+        memcpy(data_to_send, g_send_data, data_len);
+    }
+    
+    ble_gattc_write_params_t write_params = {
+        .write_op = BLE_GATT_OP_WRITE_REQ,//BLE_GATT_OP_WRITE_CMD,  // Write without response
+        .flags = 0,
+        .handle = m_char_handle,
+        .offset = 0,
+        .len = data_len,
+        .p_value = data_to_send
+    };
+    
+    print_timestamp();
+    printf("🔧 API CALL: sd_ble_gattc_write - Command Write (No Response Expected)\n");
+    uint32_t err = sd_ble_gattc_write(m_adapter, m_conn_handle, &write_params);
+    print_timestamp();
+    printf("   Result: %s (0x%08X)\n", err == NRF_SUCCESS ? "SUCCESS" : "ERROR", err);
+    
+    if (err == NRF_SUCCESS) {
+        // ✅ ADD TX PROCESS AFTER COMMAND WRITE TOO
+        print_timestamp();
+        // printf("🔧 Calling sd_ble_gattc_tx_process after command write...\n");
+        // uint32_t tx_err = sd_ble_gattc_tx_process(m_adapter, m_conn_handle);
+        // if (tx_err == NRF_SUCCESS) {
+        //     printf("✅ TX process completed successfully\n");
+        // } else {
+        //     printf("⚠️ TX process failed: 0x%08X\n", tx_err);
+        // }
+        
+        print_timestamp();
+        printf("✅ Command sent successfully! Now waiting for response...\n");
+        g_notification_start_time = time(NULL);
+        g_waiting_for_notification = true;
     }
 }
